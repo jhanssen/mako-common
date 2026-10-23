@@ -84,6 +84,7 @@ public:
     ~File();
 
     const std::string& path() const { return path_; }
+    int fd() const { return fd_; }
     uint64_t size() const { return size_; }
     uint32_t version() const { return version_; }
     uint64_t data_offset() const { return data_offset_; }
