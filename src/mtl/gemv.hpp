@@ -29,6 +29,11 @@ public:
 
     void encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                 const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off);
+    // y[i] = W[ids[i]] x_i for i < a.batch (t = 1), with matrix s at w + w_off + s * stride and int32 ids read by
+    // the GPU; x_i is x when a.x_shared, else row i of x.
+    void encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
+                        uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x, uint64_t x_off,
+                        const MTL::Buffer* y, uint64_t y_off);
 
 private:
     struct Kernel {
@@ -36,11 +41,11 @@ private:
         int nsg = 0, nr0 = 0, smem = 0;
         bool rows_per_sg_grid = false;
     };
-    Kernel& kernel(gguf::Type type, uint32_t k, uint32_t batch);
+    Kernel& kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed = false);
 
     const Context& ctx_;
     Ref<MTL::Library> lib_;
-    std::map<std::tuple<gguf::Type, bool, uint32_t>, Kernel> kernels_;
+    std::map<std::tuple<gguf::Type, bool, uint32_t, bool>, Kernel> kernels_;
 };
 
 } // namespace mako::mtl

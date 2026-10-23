@@ -3,6 +3,7 @@
 #include "mtl/embedded.hpp"
 
 #include <format>
+#include <string_view>
 #include <stdexcept>
 
 namespace mako::mtl {
@@ -18,6 +19,19 @@ struct KArgs {
     int32_t ne0, ne1;
     int32_t nr0;
     int16_t r2, r3;
+};
+
+// Layout must match the indexed kernels' argument struct.
+struct KArgsId {
+    int32_t nei0, nei1;
+    uint64_t nbi1;
+    int32_t ne00, ne01, ne02;
+    uint64_t nb00, nb01, nb02;
+    int32_t ne10, ne11, ne12, ne13;
+    uint64_t nb10, nb11, nb12;
+    int32_t ne0, ne1;
+    uint64_t nb1;
+    int32_t nr0;
 };
 
 struct TypeInfo {
@@ -80,10 +94,12 @@ uint64_t Gemv::row_bytes(gguf::Type type, uint32_t k)
     return uint64_t(k) / tr.block_elems * tr.block_bytes;
 }
 
-Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch)
+Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed)
 {
     const bool vec4 = type == gguf::Type::F32 && k % 4 == 0;
-    auto key = std::make_tuple(type, vec4, batch);
+    if (indexed)
+        batch = 1;
+    auto key = std::make_tuple(type, vec4, batch, indexed);
     if (auto it = kernels_.find(key); it != kernels_.end())
         return it->second;
 
@@ -105,6 +121,9 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch)
         kern.smem = ti->smem;
         kern.rows_per_sg_grid = ti->rows_per_sg_grid;
     }
+
+    if (indexed)
+        name.replace(0, std::string_view("kernel_mul_mv_").size(), "kernel_mul_mv_id_");
 
     Ref<MTL::FunctionConstantValues> fc(MTL::FunctionConstantValues::alloc()->init());
     const int16_t nsg = int16_t(kern.nsg), nxpsg = 16, ne12 = int16_t(batch), one = 1;
@@ -160,6 +179,51 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
     const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
     enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, a.t, a.batch),
                               MTL::Size(32, kern.nsg, 1));
+}
+
+void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
+                          uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x,
+                          uint64_t x_off, const MTL::Buffer* y, uint64_t y_off)
+{
+    if (is_iq(a.type) && a.k < 1024)
+        throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
+    if (a.t != 1)
+        throw std::runtime_error("indexed GEMV supports one token");
+    Kernel& kern = kernel(a.type, a.k, 1, true);
+
+    const int32_t nx = a.x_shared ? 1 : int32_t(a.batch);
+    KArgsId ka{};
+    ka.nei0 = int32_t(a.batch);
+    ka.nei1 = 1;
+    ka.nbi1 = uint64_t(a.batch) * 4;
+    ka.ne00 = int32_t(a.k);
+    ka.ne01 = int32_t(a.n);
+    ka.ne02 = 1;
+    ka.nb00 = gguf::traits(a.type).block_bytes;
+    ka.nb01 = row_bytes(a.type, a.k);
+    ka.nb02 = stride;
+    ka.ne10 = int32_t(a.k);
+    ka.ne11 = nx;
+    ka.ne12 = 1;
+    ka.ne13 = 1;
+    ka.nb10 = 4;
+    ka.nb11 = uint64_t(a.k) * 4;
+    ka.nb12 = ka.nb11 * uint64_t(nx);
+    ka.ne0 = int32_t(a.n);
+    ka.ne1 = int32_t(a.batch);
+    ka.nb1 = uint64_t(a.n) * 4;
+    ka.nr0 = kern.nr0;
+
+    enc->setComputePipelineState(kern.pso.get());
+    enc->setBytes(&ka, sizeof(ka), 0);
+    enc->setBuffer(w, w_off, 1);
+    enc->setBuffer(x, x_off, 2);
+    enc->setBuffer(y, y_off, 3);
+    enc->setBuffer(ids, ids_off, 4);
+    if (kern.smem)
+        enc->setThreadgroupMemoryLength(kern.smem, 0);
+    const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
+    enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, 1, a.batch), MTL::Size(32, kern.nsg, 1));
 }
 
 } // namespace mako::mtl
