@@ -12,7 +12,7 @@
 
 namespace mako::gguf {
 
-// ggml tensor types (values are the file format's).
+// GGUF tensor types (values are the file format's).
 enum class Type : uint32_t {
     F32 = 0,
     F16 = 1,
@@ -66,7 +66,7 @@ struct Array {
 struct Tensor {
     std::string name;
     Type type;
-    std::vector<uint64_t> dims; // ggml order: dims[0] is the contiguous one
+    std::vector<uint64_t> dims; // dims[0] is the contiguous one
     uint64_t offset = 0;        // absolute file offset
     uint64_t bytes = 0;
 
