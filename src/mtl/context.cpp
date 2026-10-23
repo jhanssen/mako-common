@@ -53,13 +53,31 @@ Ref<MTL::Library> Context::compile(std::string_view source) const
     return lib;
 }
 
-Ref<MTL::ComputePipelineState> Context::pipeline(MTL::Library* lib, std::string_view fn) const
+Ref<MTL::Library> Context::load(const std::string& metallib_path) const
 {
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
-    Ref<MTL::Function> f(lib->newFunction(ns_str(fn)));
-    if (!f) {
+    NS::Error* err = nullptr;
+    auto* url = NS::URL::fileURLWithPath(ns_str(metallib_path));
+    Ref<MTL::Library> lib(device_->newLibrary(url, &err));
+    if (!lib) {
+        std::string msg = "load " + metallib_path + ": " + error_text(err);
         pool->release();
-        throw std::runtime_error("no Metal function " + std::string(fn));
+        throw std::runtime_error(msg);
+    }
+    pool->release();
+    return lib;
+}
+
+Ref<MTL::ComputePipelineState> Context::pipeline(MTL::Library* lib, std::string_view fn,
+                                                 const MTL::FunctionConstantValues* constants) const
+{
+    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    NS::Error* ferr = nullptr;
+    Ref<MTL::Function> f(constants ? lib->newFunction(ns_str(fn), constants, &ferr) : lib->newFunction(ns_str(fn)));
+    if (!f) {
+        std::string msg = "no Metal function " + std::string(fn) + (ferr ? ": " + error_text(ferr) : "");
+        pool->release();
+        throw std::runtime_error(msg);
     }
     NS::Error* err = nullptr;
     Ref<MTL::ComputePipelineState> p(device_->newComputePipelineState(f.get(), &err));

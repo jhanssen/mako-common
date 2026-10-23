@@ -62,7 +62,9 @@ public:
 
     // Throws std::runtime_error with the compiler log on failure.
     Ref<MTL::Library> compile(std::string_view source) const;
-    Ref<MTL::ComputePipelineState> pipeline(MTL::Library* lib, std::string_view fn) const;
+    Ref<MTL::Library> load(const std::string& metallib_path) const;
+    Ref<MTL::ComputePipelineState> pipeline(MTL::Library* lib, std::string_view fn,
+                                            const MTL::FunctionConstantValues* constants = nullptr) const;
 
 private:
     Ref<MTL::Device> device_;
