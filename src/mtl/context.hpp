@@ -3,6 +3,7 @@
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -62,7 +63,7 @@ public:
 
     // Throws std::runtime_error with the compiler log on failure.
     Ref<MTL::Library> compile(std::string_view source) const;
-    Ref<MTL::Library> load(const std::string& metallib_path) const;
+    Ref<MTL::Library> load(std::span<const std::byte> metallib) const;
     Ref<MTL::ComputePipelineState> pipeline(MTL::Library* lib, std::string_view fn,
                                             const MTL::FunctionConstantValues* constants = nullptr) const;
 

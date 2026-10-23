@@ -1,5 +1,7 @@
 #include "mtl/gemv.hpp"
 
+#include "mtl/embedded.hpp"
+
 #include <format>
 #include <stdexcept>
 
@@ -68,7 +70,7 @@ bool is_iq(gguf::Type t)
 
 } // namespace
 
-Gemv::Gemv(const Context& ctx, const std::string& metallib_path) : ctx_(ctx), lib_(ctx.load(metallib_path)) {}
+Gemv::Gemv(const Context& ctx) : ctx_(ctx), lib_(ctx.load(gemv_metallib())) {}
 
 bool Gemv::supports(gguf::Type type) { return type == gguf::Type::F32 || info(type) != nullptr; }
 

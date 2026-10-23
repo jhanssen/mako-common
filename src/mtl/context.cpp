@@ -1,5 +1,7 @@
 #include "mtl/context.hpp"
 
+#include <dispatch/dispatch.h>
+
 #include <stdexcept>
 
 namespace mako::mtl {
@@ -53,18 +55,14 @@ Ref<MTL::Library> Context::compile(std::string_view source) const
     return lib;
 }
 
-Ref<MTL::Library> Context::load(const std::string& metallib_path) const
+Ref<MTL::Library> Context::load(std::span<const std::byte> metallib) const
 {
-    NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+    dispatch_data_t data = dispatch_data_create(metallib.data(), metallib.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     NS::Error* err = nullptr;
-    auto* url = NS::URL::fileURLWithPath(ns_str(metallib_path));
-    Ref<MTL::Library> lib(device_->newLibrary(url, &err));
-    if (!lib) {
-        std::string msg = "load " + metallib_path + ": " + error_text(err);
-        pool->release();
-        throw std::runtime_error(msg);
-    }
-    pool->release();
+    Ref<MTL::Library> lib(device_->newLibrary(data, &err));
+    dispatch_release(data);
+    if (!lib)
+        throw std::runtime_error("load embedded metallib: " + error_text(err));
     return lib;
 }
 

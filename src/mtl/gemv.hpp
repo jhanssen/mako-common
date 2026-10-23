@@ -22,7 +22,7 @@ public:
         bool x_shared = false; // every matrix reads the same x
     };
 
-    Gemv(const Context& ctx, const std::string& metallib_path);
+    explicit Gemv(const Context& ctx);
 
     static bool supports(gguf::Type type);
     static uint64_t row_bytes(gguf::Type type, uint32_t k);
