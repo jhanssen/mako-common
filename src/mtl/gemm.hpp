@@ -16,9 +16,10 @@ public:
 
     static bool supports(gguf::Type type);
 
+    // y rows are ldy elements apart (0: n).
     void encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                 const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y,
-                uint64_t y_off);
+                uint64_t y_off, uint32_t ldy = 0);
 
 private:
     const Context& ctx_;

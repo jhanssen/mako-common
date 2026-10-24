@@ -11,6 +11,7 @@ constant int TM = 64, TN = 64, TK = 64;
 
 struct GemmArgs {
     uint t, k, n, row_bytes;
+    uint ldy; // y row stride in elements
 };
 
 enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2 };
@@ -100,7 +101,8 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const float* x [[bu
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(y, dextents<int32_t, 2>(a.n, a.t));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(y, dextents<int32_t, 2>(a.n, a.t),
+                                                                 array<int32_t, 2>{1, int32_t(a.ldy)});
     acc.store(ty.slice(n0, t0));
 }
 
