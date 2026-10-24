@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace mako::text {
@@ -21,6 +22,9 @@ public:
 
     // Control tokens written in the text are recognized only with parse_special; user-defined ones always are.
     std::vector<int32_t> encode(std::string_view text, bool parse_special) const;
+    // Control tokens are recognized except where they overlap one of the sorted, disjoint byte ranges [first, second)
+    // (text from a chat template's input).
+    std::vector<int32_t> encode(std::string_view text, std::span<const std::pair<size_t, size_t>> literal) const;
     // Control tokens are rendered as their text only with `special`.
     std::string decode(std::span<const int32_t> ids, bool special = true) const;
 

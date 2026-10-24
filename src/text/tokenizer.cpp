@@ -323,12 +323,22 @@ void Tokenizer::encode_plain(std::string_view text, std::vector<int32_t>& out) c
 
 std::vector<int32_t> Tokenizer::encode(std::string_view text, bool parse_special) const
 {
+    const std::pair<size_t, size_t> all{0, text.size()};
+    return encode(text, parse_special ? std::span<const std::pair<size_t, size_t>>{} : std::span(&all, 1));
+}
+
+std::vector<int32_t> Tokenizer::encode(std::string_view text, std::span<const std::pair<size_t, size_t>> literal) const
+{
+    const auto in_literal = [&](size_t begin, size_t end) {
+        // The first range ending after begin is the only one that can overlap [begin, end).
+        auto it = std::ranges::upper_bound(literal, begin, {}, &std::pair<size_t, size_t>::second);
+        return it != literal.end() && it->first < end;
+    };
     // Fragments are either raw text or a special token id; longer special tokens split first.
     using Fragment = std::variant<std::string_view, int32_t>;
     std::vector<Fragment> frags{text};
     for (int32_t id : specials_) {
-        if (!parse_special && types_[id] != TokenType::UserDefined)
-            continue;
+        const bool control = types_[id] != TokenType::UserDefined;
         const std::string& tok = tokens_[id];
         if (tok.empty())
             continue;
@@ -340,11 +350,17 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool parse_special
                 continue;
             }
             std::string_view rest = *raw;
-            for (size_t pos; (pos = rest.find(tok)) != std::string_view::npos;) {
+            for (size_t pos, from = 0; (pos = rest.find(tok, from)) != std::string_view::npos;) {
+                const size_t at = size_t(rest.data() - text.data()) + pos;
+                if (control && in_literal(at, at + tok.size())) {
+                    from = pos + 1;
+                    continue;
+                }
                 if (pos)
                     next.emplace_back(rest.substr(0, pos));
                 next.emplace_back(id);
                 rest.remove_prefix(pos + tok.size());
+                from = 0;
             }
             if (!rest.empty())
                 next.emplace_back(rest);
