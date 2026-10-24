@@ -11,7 +11,7 @@ namespace {
 
 // Layout must match GemmArgs in gemm.metal.
 struct GemmArgs {
-    uint32_t t, k, n, row_bytes, ldy;
+    uint32_t t, k, n, row_bytes, ldy, ldx;
 };
 
 const char* kernel_name(gguf::Type type)
@@ -36,16 +36,17 @@ bool Gemm::supports(gguf::Type type) { return kernel_name(type) != nullptr; }
 
 void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                   const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y,
-                  uint64_t y_off, uint32_t ldy)
+                  uint64_t y_off, uint32_t ldy, uint32_t ldx)
 {
-    const char* name = kernel_name(type);
-    if (!name || k % 64)
+    const char* base = kernel_name(type);
+    if (!base || k % 64)
         throw std::runtime_error(std::format("no GEMM for {} with k={}", gguf::traits(type).name, k));
+    const std::string name = exact_ ? std::string(base) + "_x32" : std::string(base);
     auto it = psos_.find(name);
     if (it == psos_.end())
         it = psos_.emplace(name, ctx_.pipeline(lib_.get(), name)).first;
     const auto tr = gguf::traits(type);
-    const GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes), ldy ? ldy : n};
+    const GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes), ldy ? ldy : n, ldx ? ldx : k};
     enc->setComputePipelineState(it->second.get());
     enc->setBuffer(w, w_off, 0);
     enc->setBuffer(x, x_off, 1);

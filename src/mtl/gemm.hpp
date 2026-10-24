@@ -15,16 +15,19 @@ public:
     explicit Gemm(const Context& ctx);
 
     static bool supports(gguf::Type type);
+    // On: activations stay float in the multiply (only weights become half); off: both half, faster.
+    void set_exact_activations(bool on) { exact_ = on; }
 
-    // y rows are ldy elements apart (0: n).
+    // y rows are ldy elements apart (0: n), x rows ldx (0: k; 16-byte aligned).
     void encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                 const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y,
-                uint64_t y_off, uint32_t ldy = 0);
+                uint64_t y_off, uint32_t ldy = 0, uint32_t ldx = 0);
 
 private:
     const Context& ctx_;
     Ref<MTL::Library> lib_;
     std::map<std::string, Ref<MTL::ComputePipelineState>> psos_;
+    bool exact_ = false;
 };
 
 } // namespace mako::mtl
