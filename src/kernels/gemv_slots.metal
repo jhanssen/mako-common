@@ -28,6 +28,87 @@ kernel void mako_mul_mv_slots(constant ggml_metal_kargs_mul_mv_id& args, device 
     disp_fn(args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiitg, tiisg, sgitg);
 }
 
+// Q6_K rows for NT tokens at once (x rows nb11 apart, y rows ne0 apart): the per-format kernel's layout and per-token
+// arithmetic (so the same results), but each weight block is decoded once for all the tokens instead of being
+// read again per token. Grid (row groups, 1, matrices).
+template <int NT>
+kernel void mako_mul_mv_q6_K_tokens(constant ggml_metal_kargs_mul_mv& args, device const char* src0,
+                                    device const char* src1, device char* dst,
+                                    uint3 tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiisg [[thread_index_in_simdgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr short nr0 = N_R0_Q6_K;
+    const short NSG = FC_mul_mv_nsg;
+    constexpr uint8_t kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+    const uint im = tgpig.z;
+    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const uint64_t offset0 = first_row * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 + (i13 / FC_mul_mv_r3) * args.nb03;
+    const uint64_t offset1 = i12 * args.nb12 + i13 * args.nb13;
+    device const block_q6_K* x = (device const block_q6_K*)(src0 + offset0);
+
+    float sumf[NT][nr0] = {};
+    float yl[NT][16];
+    const short tid = tiisg / 2, ix = tiisg % 2, ip = tid / 8, il = tid % 8, l0 = 4 * il, is = 8 * ip + l0 / 16;
+    const short y_offset = 128 * ip + l0, q_offset_l = 64 * ip + l0, q_offset_h = 32 * ip + l0;
+
+    for (int i = ix; i < nb; i += 2) {
+        device const uint8_t* q1 = x[i].ql + q_offset_l;
+        device const uint8_t* q2 = q1 + 32;
+        device const uint8_t* qh = x[i].qh + q_offset_h;
+        device const int8_t* sc = x[i].scales + is;
+        device const half* dh = &x[i].d;
+        for (short t = 0; t < NT; ++t) {
+            device const float* y = (device const float*)(src1 + offset1 + t * args.nb11) + i * QK_K + y_offset;
+            for (short l = 0; l < 4; ++l) {
+                yl[t][4 * l + 0] = y[l + 0];
+                yl[t][4 * l + 1] = y[l + 32];
+                yl[t][4 * l + 2] = y[l + 64];
+                yl[t][4 * l + 3] = y[l + 96];
+            }
+        }
+        for (short row = 0; row < nr0; ++row) {
+            float q[4][4];
+            FOR_UNROLL (short l = 0; l < 4; ++l) {
+                q[l][0] = (int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32;
+                q[l][1] = (int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32;
+                q[l][2] = (int8_t)((q1[l] >> 4) | ((qh[l] & kmask3) << 0)) - 32;
+                q[l][3] = (int8_t)((q2[l] >> 4) | ((qh[l] & kmask4) >> 2)) - 32;
+            }
+            const float d = dh[0];
+            for (short t = 0; t < NT; ++t) {
+                float4 sums = {0.f, 0.f, 0.f, 0.f};
+                FOR_UNROLL (short l = 0; l < 4; ++l)
+                    for (short c = 0; c < 4; ++c)
+                        sums[c] += yl[t][4 * l + c] * q[l][c];
+                sumf[t][row] += d * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            }
+            q1 += args.nb01;
+            q2 += args.nb01;
+            qh += args.nb01;
+            sc += args.nb01;
+            dh += args.nb01 / 2;
+        }
+    }
+    for (short t = 0; t < NT; ++t) {
+        device float* dst_f32 = (device float*)dst + uint64_t(im) * args.ne0 * args.ne1 + uint64_t(t) * args.ne0;
+        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+            const float sum_all = simd_sum(sumf[t][row]);
+            if (tiisg == 0)
+                dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+template [[host_name("mako_mul_mv_q6_K_t2")]] kernel void mako_mul_mv_q6_K_tokens<2>(constant ggml_metal_kargs_mul_mv&,
+    device const char*, device const char*, device char*, uint3, ushort, ushort);
+template [[host_name("mako_mul_mv_q6_K_t3")]] kernel void mako_mul_mv_q6_K_tokens<3>(constant ggml_metal_kargs_mul_mv&,
+    device const char*, device const char*, device char*, uint3, ushort, ushort);
+template [[host_name("mako_mul_mv_q6_K_t4")]] kernel void mako_mul_mv_q6_K_tokens<4>(constant ggml_metal_kargs_mul_mv&,
+    device const char*, device const char*, device char*, uint3, ushort, ushort);
+
 typedef decltype(mako_mul_mv_slots<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) mako_mul_mv_slots_t;
 typedef decltype(mako_mul_mv_slots<mmv_fn<kernel_mul_mv_t_t_4_disp<float, float4, float, float4>>>) mako_mul_mv_slots_4_t;
 

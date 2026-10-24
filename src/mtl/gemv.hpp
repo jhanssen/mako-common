@@ -28,6 +28,7 @@ public:
         uint32_t t = 1;       // tokens
         uint32_t batch = 1;   // matrices, each with its own y
         bool x_shared = false; // every matrix reads the same x
+        uint32_t ids_stride = 0; // encode_indexed: bytes between tokens' id rows (0: batch ids, packed)
     };
 
     explicit Gemv(const Context& ctx);
@@ -57,7 +58,8 @@ private:
         int nsg = 0, nr0 = 0, smem = 0;
         bool rows_per_sg_grid = false;
     };
-    Kernel& kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed = false);
+    // tokens > 1: a kernel that runs that many tokens per threadgroup (weights read once), where there is one.
+    Kernel& kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed = false, uint32_t tokens = 1);
 
     bool encode_short(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                       const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off);
@@ -67,7 +69,7 @@ private:
     Ref<MTL::Library> lib_, own_lib_;
     std::map<std::string, Ref<MTL::ComputePipelineState>> own_psos_;
     bool own_kernels_ = true;
-    std::map<std::tuple<gguf::Type, bool, uint32_t, bool>, Kernel> kernels_;
+    std::map<std::tuple<gguf::Type, bool, uint32_t, bool, uint32_t>, Kernel> kernels_;
 };
 
 } // namespace mako::mtl

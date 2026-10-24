@@ -84,7 +84,7 @@ bool is_iq(gguf::Type t)
 
 // Layout must match ShortArgs in gemv.metal.
 struct ShortArgs {
-    uint32_t k, n, row_bytes;
+    uint32_t k, n, row_bytes, tokens;
 };
 
 } // namespace
@@ -103,9 +103,9 @@ bool Gemv::encode_short(MTL::ComputeCommandEncoder* enc, const Args& a, const MT
                         const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off)
 {
     const bool q8 = a.type == gguf::Type::Q8_0;
-    if (!own_kernels_ || (!q8 && a.type != gguf::Type::F32) || a.batch != 1 || a.t != 1 || a.k % 32 || a.k > 512)
+    if (!own_kernels_ || (!q8 && a.type != gguf::Type::F32) || a.batch != 1 || a.t > 4 || a.k % 32 || a.k > 512)
         return false;
-    const ShortArgs sa{a.k, a.n, uint32_t(row_bytes(a.type, a.k))};
+    const ShortArgs sa{a.k, a.n, uint32_t(row_bytes(a.type, a.k)), a.t};
     enc->setComputePipelineState(own(q8 ? "gemv_short_q8_0" : "gemv_short_f32"));
     enc->setBuffer(w, w_off, 0);
     enc->setBuffer(x, x_off, 1);
@@ -123,12 +123,12 @@ uint64_t Gemv::row_bytes(gguf::Type type, uint32_t k)
     return uint64_t(k) / tr.block_elems * tr.block_bytes;
 }
 
-Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed)
+Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed, uint32_t tokens)
 {
     const bool vec4 = type == gguf::Type::F32 && k % 4 == 0;
     if (indexed)
         batch = 1;
-    auto key = std::make_tuple(type, vec4, batch, indexed);
+    auto key = std::make_tuple(type, vec4, batch, indexed, tokens);
     if (auto it = kernels_.find(key); it != kernels_.end())
         return it->second;
 
@@ -153,6 +153,8 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
 
     if (indexed)
         name.replace(0, std::string_view("kernel_mul_mv_").size(), "mako_mul_mv_slots_");
+    else if (tokens > 1)
+        name = std::format("mako_mul_mv_q6_K_t{}", tokens);
 
     Ref<MTL::FunctionConstantValues> fc(MTL::FunctionConstantValues::alloc()->init());
     const int16_t nsg = int16_t(kern.nsg), nxpsg = 16, ne12 = int16_t(batch), one = 1;
@@ -176,7 +178,9 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
     if (a.batch > 32767)
         throw std::runtime_error("GEMV batch too large");
-    Kernel& kern = kernel(a.type, a.k, a.batch);
+    // Q6_K for 2 tokens: one threadgroup row for both, each weight block decoded once.
+    const uint32_t tokens = own_kernels_ && a.type == gguf::Type::Q6_K && a.t == 2 ? 2 : 1; // 4: slower (spills)
+    Kernel& kern = kernel(a.type, a.k, a.batch, false, tokens);
 
     const uint64_t rb = row_bytes(a.type, a.k);
     KArgs ka{};
@@ -208,7 +212,7 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
     if (kern.smem)
         enc->setThreadgroupMemoryLength(kern.smem, 0);
     const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
-    enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, a.t, a.batch),
+    enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, tokens > 1 ? 1 : a.t, a.batch),
                               MTL::Size(32, kern.nsg, 1));
 }
 
@@ -221,15 +225,14 @@ void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const 
         throw std::runtime_error("indexed GEMV over lent expert slots");
     if (is_iq(a.type) && a.k < 1024)
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
-    if (a.t != 1)
-        throw std::runtime_error("indexed GEMV supports one token");
     Kernel& kern = kernel(a.type, a.k, 1, true);
 
+    // a.t tokens, each with a row of a.batch ids (ids_stride bytes apart) and its own x row(s).
     const int32_t nx = a.x_shared ? 1 : int32_t(a.batch);
     KArgsId ka{};
     ka.nei0 = int32_t(a.batch);
-    ka.nei1 = 1;
-    ka.nbi1 = uint64_t(a.batch) * 4;
+    ka.nei1 = int32_t(a.t);
+    ka.nbi1 = a.ids_stride ? a.ids_stride : uint64_t(a.batch) * 4;
     ka.ne00 = int32_t(a.k);
     ka.ne01 = int32_t(a.n);
     ka.ne02 = 1;
@@ -268,7 +271,7 @@ MTL::Size Gemv::indexed_grid(const Args& a)
 {
     const Kernel& kern = kernel(a.type, a.k, 1, true);
     const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
-    return MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, 1, a.batch);
+    return MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, 1, uint64_t(a.batch) * a.t);
 }
 
 } // namespace mako::mtl
