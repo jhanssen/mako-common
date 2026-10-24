@@ -19,7 +19,7 @@ struct GemmArgs {
     uint ldy; // y row stride in elements
 };
 
-enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5 };
+enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6 };
 
 // 8 weights from a grid entry (8 or 4 bytes per entry), signs from bit i of sb, times dl.
 static void grid8(constant uchar* g, uint sb, float dl, threadgroup half* out)
@@ -32,7 +32,11 @@ static void grid8(constant uchar* g, uint sb, float dl, threadgroup half* out)
 template <int Type>
 static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
 {
-    if (Type == F32) {
+    if (Type == F16) {
+        device const half* p = reinterpret_cast<device const half*>(row) + k0;
+        for (short i = 0; i < 32; ++i)
+            out[i] = p[i];
+    } else if (Type == F32) {
         device const float4* p = reinterpret_cast<device const float4*>(row) + k0 / 4;
         for (short i = 0; i < 8; ++i) {
             const float4 v = p[i];
@@ -168,3 +172,54 @@ template [[host_name("gemm_iq2_s")]] kernel void gemm<IQ2_S>(device const uchar*
                                                              constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_iq3_xxs")]] kernel void gemm<IQ3_XXS>(device const uchar*, device const float*,
                                                                  device float*, constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f16")]] kernel void gemm<F16>(device const uchar*, device const float*, device float*,
+                                                         constant GemmArgs&, uint2, ushort);
+
+struct PvArgs {
+    uint heads, dim, n_kv;
+    uint keys_per_split; // a multiple of 64
+};
+
+// Attention output for one query position over a shared latent cache, split over keys:
+// partial[split][h][d] = sum over the split's keys t of p[h][t] * kv[t][d]. Threadgroups (dim / 64,
+// ceil(heads / 64), splits) of 4 simdgroups; keys past n_kv count as zero.
+kernel void attn_pv(device const float* p [[buffer(0)]], device const half* kv [[buffer(1)]],
+                    device float* partial [[buffer(2)]], constant PvArgs& a [[buffer(3)]],
+                    uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]])
+{
+    threadgroup half ps[TM * TK], ks[TK * TN];
+    const uint d0 = tg.x * TN, h0 = tg.y * TM;
+    const uint t_begin = tg.z * a.keys_per_split, t_end = min(a.n_kv, t_begin + a.keys_per_split);
+    const uint r = tid / 2, c = (tid % 2) * 32;
+
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(ps, dextents<int32_t, 2>(TK, TM));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tk(ks, dextents<int32_t, 2>(TN, TK));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, false, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto acc = op.get_destination_cooperative_tensor<decltype(tp), decltype(tk), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+
+    for (uint t0 = t_begin; t0 < t_end; t0 += TK) {
+        // p tile: head h0 + r, keys t0 + c ..; kv tile: key t0 + r, dims d0 + c ..
+        threadgroup half* po = ps + r * TK + c;
+        threadgroup half* ko = ks + r * TN + c;
+        for (short i = 0; i < 32; ++i) {
+            const uint t = t0 + c + i;
+            po[i] = (h0 + r < a.heads && t < t_end) ? half(p[uint64_t(h0 + r) * a.n_kv + t]) : 0.0h;
+        }
+        const uint tk_row = t0 + r;
+        device const half* kr = kv + uint64_t(tk_row) * a.dim + d0 + c;
+        for (short i = 0; i < 32; ++i)
+            ko[i] = tk_row < t_end ? kr[i] : 0.0h;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(tp, tk, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(partial + uint64_t(tg.z) * a.heads * a.dim,
+                                                                 dextents<int32_t, 2>(a.dim, a.heads));
+    acc.store(to.slice(d0, h0));
+}

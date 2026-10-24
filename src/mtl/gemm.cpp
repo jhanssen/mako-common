@@ -23,6 +23,7 @@ const char* kernel_name(gguf::Type type)
     case gguf::Type::IQ2_XXS: return "gemm_iq2_xxs";
     case gguf::Type::IQ2_S: return "gemm_iq2_s";
     case gguf::Type::IQ3_XXS: return "gemm_iq3_xxs";
+    case gguf::Type::F16: return "gemm_f16";
     default: return nullptr;
     }
 }
