@@ -297,44 +297,55 @@ kernel void attn_gather_scores(device const half* q [[buffer(0)]], device const 
     acc.store(ty.slice(n0, 0));
 }
 
-// partial[split][t][h][d] = sum over the split's list entries s of p[t][h][s] * kv[list[t][s]][d]; grid (dim / 64,
-// 1, tokens * splits), 4 simdgroups; entries past count[t] count as zero.
+// partial[split][t][h][d] = sum over the split's list entries s of p[t][h][s] * kv[list[t][s]][d]; grid (dim / 128,
+// 1, tokens * splits), 8 simdgroups; heads <= 64, entries past count[t] count as zero. Wide output tiles so each
+// token's probabilities are read dim / 128 times.
 kernel void attn_gather_pv(device const float* p [[buffer(0)]], device const half* kv [[buffer(1)]],
                            device const uint* list [[buffer(2)]], device const uint* count [[buffer(3)]],
                            device float* partial [[buffer(4)]], constant GatherArgs& a [[buffer(5)]],
                            uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]])
 {
-    threadgroup half ps[TM * TK], ks[TK * TN];
-    const uint t = tg.z / a.splits, split = tg.z % a.splits, d0 = tg.x * TN, cnt = count[t];
+    constexpr int PN = 128;
+    threadgroup half ps[TM * TK], ks[TK * PN];
+    const uint t = tg.z / a.splits, split = tg.z % a.splits, d0 = tg.x * PN, cnt = count[t];
     const uint per = (a.stride + a.splits * TK - 1) / (a.splits * TK) * TK;
     const uint s_begin = split * per, s_end = min(cnt, s_begin + per);
-    const uint r = tid / 2, c = (tid % 2) * 32;
+    // Loads: thread tid fills 16 probabilities of head r and 32 latent values of entry r.
+    const uint r = tid / 4, pc = (tid % 4) * 16, kc = (tid % 4) * 32;
     p += uint64_t(t) * a.heads * a.stride;
     list += uint64_t(t) * a.stride;
     tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(ps, dextents<int32_t, 2>(TK, TM));
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tk(ks, dextents<int32_t, 2>(TN, TK));
-    constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, false, false,
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tk(ks, dextents<int32_t, 2>(PN, TK));
+    constexpr auto desc = matmul2d_descriptor(TM, PN, TK, false, false, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc, execution_simdgroups<4>> op;
+    matmul2d<desc, execution_simdgroups<8>> op;
     auto acc = op.get_destination_cooperative_tensor<decltype(tp), decltype(tk), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] = 0.0f;
     for (uint s0 = s_begin; s0 < s_end; s0 += TK) {
-        threadgroup half* po = ps + r * TK + c;
-        threadgroup half* ko = ks + r * TN + c;
-        for (short i = 0; i < 32; ++i) {
-            const uint s = s0 + c + i;
-            po[i] = (r < a.heads && s < s_end) ? half(p[uint64_t(r) * a.stride + s]) : 0.0h;
+        threadgroup half* po = ps + r * TK + pc;
+        const uint sp = s0 + pc;
+        if (r < a.heads && sp + 16 <= s_end) {
+            device const float4* pr = reinterpret_cast<device const float4*>(p + uint64_t(r) * a.stride + sp);
+            for (short i = 0; i < 4; ++i) {
+                const half4 v = half4(pr[i]);
+                for (short j = 0; j < 4; ++j)
+                    po[i * 4 + j] = v[j];
+            }
+        } else {
+            for (short i = 0; i < 16; ++i)
+                po[i] = (r < a.heads && sp + i < s_end) ? half(p[uint64_t(r) * a.stride + sp + i]) : 0.0h;
         }
+        threadgroup half4* ko = reinterpret_cast<threadgroup half4*>(ks + r * PN + kc);
         const uint sr = s0 + r;
         if (sr < s_end) {
-            device const half* kr = kv + uint64_t(list[sr]) * a.dim + d0 + c;
-            for (short i = 0; i < 32; ++i)
+            device const half4* kr = reinterpret_cast<device const half4*>(kv + uint64_t(list[sr]) * a.dim + d0 + kc);
+            for (short i = 0; i < 8; ++i)
                 ko[i] = kr[i];
         } else {
-            for (short i = 0; i < 32; ++i)
-                ko[i] = 0.0h;
+            for (short i = 0; i < 8; ++i)
+                ko[i] = half4(0.0h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         op.run(tp, tk, acc);
