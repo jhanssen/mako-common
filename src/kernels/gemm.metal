@@ -344,3 +344,30 @@ kernel void attn_gather_pv(device const float* p [[buffer(0)]], device const hal
         partial + (uint64_t(split) * a.tokens + t) * a.heads * a.dim, dextents<int32_t, 2>(a.dim, a.heads));
     acc.store(to.slice(d0, 0));
 }
+
+// Indexer dot products for consecutive tokens: dots[t][h][p] = q[t][h] . pooled[p] in float (matmul2d float x float),
+// over the pools token 0 can see and beyond (the reduction stops at each token's own count). Grid (ceil(pools / 64),
+// 1, tokens), 4 simdgroups; heads <= 32 (padded to 32 rows), dim the reduction length.
+struct IdxDotArgs {
+    uint heads, dim, pools; // pools: of the last token
+    uint stride;            // dots row length
+};
+kernel void idx_dots(device const float* q [[buffer(0)]], device const float* pooled [[buffer(1)]],
+                     device float* dots [[buffer(2)]], constant IdxDotArgs& a [[buffer(3)]],
+                     uint3 tg [[threadgroup_position_in_grid]])
+{
+    const uint t = tg.z, p0 = tg.x * 64;
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device float*>(q) + uint64_t(t) * a.heads * a.dim,
+                                                                 dextents<int32_t, 2>(a.dim, a.heads));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tk(const_cast<device float*>(pooled),
+                                                                 dextents<int32_t, 2>(a.dim, a.pools));
+    constexpr auto desc = matmul2d_descriptor(32, 64, dynamic_length_v<int>, false, true, false);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> td(dots + uint64_t(t) * a.heads * a.stride,
+                                                                 dextents<int32_t, 2>(a.pools, a.heads),
+                                                                 array<int32_t, 2>{1, int32_t(a.stride)});
+    auto mq = tq.slice(0, 0);
+    auto mk = tk.slice(0, int(p0));
+    auto md = td.slice(int(p0), 0);
+    op.run(mq, mk, md);
+}
