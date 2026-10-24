@@ -51,6 +51,8 @@ struct DeviceInfo {
     uint64_t max_buffer = 0;
     uint64_t recommended_working_set = 0;
     uint64_t max_threadgroup_memory = 0;
+    // GPU timestamp sampling: where it can be taken, and whether the timestamp counter set exists.
+    bool counters_stage = false, counters_dispatch = false, counters_blit = false, timestamp_set = false;
 };
 
 class Context {

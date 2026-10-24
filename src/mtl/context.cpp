@@ -36,6 +36,13 @@ Context::Context()
     info_.max_buffer = device_->maxBufferLength();
     info_.recommended_working_set = device_->recommendedMaxWorkingSetSize();
     info_.max_threadgroup_memory = device_->maxThreadgroupMemoryLength();
+    info_.counters_stage = device_->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
+    info_.counters_dispatch = device_->supportsCounterSampling(MTL::CounterSamplingPointAtDispatchBoundary);
+    info_.counters_blit = device_->supportsCounterSampling(MTL::CounterSamplingPointAtBlitBoundary);
+    if (NS::Array* sets = device_->counterSets())
+        for (NS::UInteger i = 0; i < sets->count(); ++i)
+            if (sets->object<MTL::CounterSet>(i)->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
+                info_.timestamp_set = true;
 }
 
 Ref<MTL::Library> Context::compile(std::string_view source) const
