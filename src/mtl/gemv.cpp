@@ -152,7 +152,7 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
     }
 
     if (indexed)
-        name.replace(0, std::string_view("kernel_mul_mv_").size(), "kernel_mul_mv_id_");
+        name.replace(0, std::string_view("kernel_mul_mv_").size(), "mako_mul_mv_slots_");
 
     Ref<MTL::FunctionConstantValues> fc(MTL::FunctionConstantValues::alloc()->init());
     const int16_t nsg = int16_t(kern.nsg), nxpsg = 16, ne12 = int16_t(batch), one = 1;
@@ -215,8 +215,10 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
 void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                           uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x,
                           uint64_t x_off, const MTL::Buffer* y, uint64_t y_off, const MTL::Buffer* indirect,
-                          uint64_t indirect_off)
+                          uint64_t indirect_off, const Tail& tail)
 {
+    if (tail.split != UINT32_MAX && !tail.buf)
+        throw std::runtime_error("indexed GEMV over lent expert slots");
     if (is_iq(a.type) && a.k < 1024)
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
     if (a.t != 1)
@@ -252,6 +254,8 @@ void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const 
     enc->setBuffer(x, x_off, 2);
     enc->setBuffer(y, y_off, 3);
     enc->setBuffer(ids, ids_off, 4);
+    enc->setBuffer(tail.buf ? tail.buf : w, tail.buf ? tail.off : w_off, 5);
+    enc->setBytes(&tail.split, sizeof(tail.split), 6);
     if (kern.smem)
         enc->setThreadgroupMemoryLength(kern.smem, 0);
     if (indirect)

@@ -1,4 +1,5 @@
-# Third-party per-format GEMV kernels (MIT), pinned by commit and hash, compiled offline into a metallib.
+# Third-party per-format GEMV kernels (MIT), pinned by commit and hash, compiled offline into a metallib together
+# with the slot-indexed wrapper that includes them.
 set(GEMV_KERNELS_COMMIT 9ff0d7e90f0faaa7c16017e6dcf9cf91c50a100e)
 set(GEMV_KERNELS_DIR ${CMAKE_BINARY_DIR}/third_party/gemv-kernels)
 set(_base https://raw.githubusercontent.com/ggml-org/llama.cpp/${GEMV_KERNELS_COMMIT})
@@ -21,8 +22,8 @@ set(GEMV_METALLIB ${CMAKE_BINARY_DIR}/gemv.metallib)
 add_custom_command(
     OUTPUT ${GEMV_METALLIB}
     COMMAND xcrun -sdk macosx metal -std=metal4.0 -I ${GEMV_KERNELS_DIR}
-            -c ${GEMV_KERNELS_DIR}/mul_mv.metal -o ${CMAKE_BINARY_DIR}/gemv.air
+            -c ${CMAKE_SOURCE_DIR}/src/kernels/gemv_slots.metal -o ${CMAKE_BINARY_DIR}/gemv.air
     COMMAND xcrun -sdk macosx metallib ${CMAKE_BINARY_DIR}/gemv.air -o ${GEMV_METALLIB}
-    DEPENDS ${GEMV_KERNELS_DIR}/mul_mv.metal
+    DEPENDS ${GEMV_KERNELS_DIR}/mul_mv.metal ${CMAKE_SOURCE_DIR}/src/kernels/gemv_slots.metal
     COMMENT "Compiling reference GEMV kernels")
 add_custom_target(gemv_metallib DEPENDS ${GEMV_METALLIB})
