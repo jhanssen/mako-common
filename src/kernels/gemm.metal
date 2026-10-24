@@ -242,3 +242,105 @@ kernel void attn_pv(device const float* p [[buffer(0)]], device const half* kv [
                                                                  dextents<int32_t, 2>(a.dim, a.heads));
     acc.store(to.slice(d0, h0));
 }
+
+// Sparse attention over a shared half latent cache: each query token attends to the cache rows in its own index list
+// (list rows of `stride` entries, count[t] used), so the work per token is bounded by the list, not the context.
+struct GatherArgs {
+    uint heads;  // query rows per token
+    uint dim;    // latent width (multiple of 256)
+    uint stride; // list and score row length
+    uint splits; // attn_gather_pv: key ranges per token
+    uint tokens; // attn_gather_pv: partial is [splits][tokens][heads][dim]
+};
+
+// scores[t][h][s] = q[t][h] . kv[list[t][s]]; grid (ceil(stride / 32), 1, tokens), 4 simdgroups; heads <= 64.
+kernel void attn_gather_scores(device const half* q [[buffer(0)]], device const half* kv [[buffer(1)]],
+                               device const uint* list [[buffer(2)]], device const uint* count [[buffer(3)]],
+                               device float* scores [[buffer(4)]], constant GatherArgs& a [[buffer(5)]],
+                               uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]])
+{
+    constexpr int GM = 64, GN = 32, GK = 256;
+    threadgroup half ws[GN * GK];
+    const uint t = tg.z, n0 = tg.x * GN, cnt = count[t];
+    list += uint64_t(t) * a.stride;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device half*>(q) + uint64_t(t) * a.heads * a.dim,
+                                                                dextents<int32_t, 2>(a.dim, a.heads));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(GK, GN));
+    constexpr auto desc = matmul2d_descriptor(GM, GN, GK, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto mx = tx.slice(0, 0);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(tw), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    for (uint k = 0; k < a.dim; k += GK) {
+        for (uint s = tid; s < GN * (GK / 32); s += 128) {
+            const uint r = s / (GK / 32), c = (s % (GK / 32)) * 32;
+            threadgroup half* wo = ws + r * GK + c;
+            if (n0 + r < cnt) {
+                device const half* src = kv + uint64_t(list[n0 + r]) * a.dim + k + c;
+                for (short i = 0; i < 32; ++i)
+                    wo[i] = src[i];
+            } else {
+                for (short i = 0; i < 32; ++i)
+                    wo[i] = 0.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto xk = tx.slice(int(k), 0);
+        op.run(xk, tw, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(scores + uint64_t(t) * a.heads * a.stride,
+                                                                 dextents<int32_t, 2>(a.stride, a.heads));
+    acc.store(ty.slice(n0, 0));
+}
+
+// partial[split][t][h][d] = sum over the split's list entries s of p[t][h][s] * kv[list[t][s]][d]; grid (dim / 64,
+// 1, tokens * splits), 4 simdgroups; entries past count[t] count as zero.
+kernel void attn_gather_pv(device const float* p [[buffer(0)]], device const half* kv [[buffer(1)]],
+                           device const uint* list [[buffer(2)]], device const uint* count [[buffer(3)]],
+                           device float* partial [[buffer(4)]], constant GatherArgs& a [[buffer(5)]],
+                           uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]])
+{
+    threadgroup half ps[TM * TK], ks[TK * TN];
+    const uint t = tg.z / a.splits, split = tg.z % a.splits, d0 = tg.x * TN, cnt = count[t];
+    const uint per = (a.stride + a.splits * TK - 1) / (a.splits * TK) * TK;
+    const uint s_begin = split * per, s_end = min(cnt, s_begin + per);
+    const uint r = tid / 2, c = (tid % 2) * 32;
+    p += uint64_t(t) * a.heads * a.stride;
+    list += uint64_t(t) * a.stride;
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp(ps, dextents<int32_t, 2>(TK, TM));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tk(ks, dextents<int32_t, 2>(TN, TK));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, false, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto acc = op.get_destination_cooperative_tensor<decltype(tp), decltype(tk), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    for (uint s0 = s_begin; s0 < s_end; s0 += TK) {
+        threadgroup half* po = ps + r * TK + c;
+        threadgroup half* ko = ks + r * TN + c;
+        for (short i = 0; i < 32; ++i) {
+            const uint s = s0 + c + i;
+            po[i] = (r < a.heads && s < s_end) ? half(p[uint64_t(r) * a.stride + s]) : 0.0h;
+        }
+        const uint sr = s0 + r;
+        if (sr < s_end) {
+            device const half* kr = kv + uint64_t(list[sr]) * a.dim + d0 + c;
+            for (short i = 0; i < 32; ++i)
+                ko[i] = kr[i];
+        } else {
+            for (short i = 0; i < 32; ++i)
+                ko[i] = 0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        op.run(tp, tk, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(
+        partial + (uint64_t(split) * a.tokens + t) * a.heads * a.dim, dextents<int32_t, 2>(a.dim, a.heads));
+    acc.store(to.slice(d0, 0));
+}
