@@ -30,10 +30,14 @@ public:
     void encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                 const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off);
     // y[i] = W[ids[i]] x_i for i < a.batch (t = 1), with matrix s at w + w_off + s * stride and int32 ids read by
-    // the GPU; x_i is x when a.x_shared, else row i of x.
+    // the GPU; x_i is x when a.x_shared, else row i of x. With `indirect`, the threadgroup grid is read from it
+    // (MTLDispatchThreadgroupsIndirectArguments): x and y as indexed_grid() gives them, z the number of ids to run.
     void encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                         uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x, uint64_t x_off,
-                        const MTL::Buffer* y, uint64_t y_off);
+                        const MTL::Buffer* y, uint64_t y_off, const MTL::Buffer* indirect = nullptr,
+                        uint64_t indirect_off = 0);
+    // The threadgroup grid encode_indexed dispatches for all a.batch ids.
+    MTL::Size indexed_grid(const Args& a);
 
 private:
     struct Kernel {

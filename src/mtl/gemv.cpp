@@ -183,7 +183,8 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
 
 void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                           uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x,
-                          uint64_t x_off, const MTL::Buffer* y, uint64_t y_off)
+                          uint64_t x_off, const MTL::Buffer* y, uint64_t y_off, const MTL::Buffer* indirect,
+                          uint64_t indirect_off)
 {
     if (is_iq(a.type) && a.k < 1024)
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
@@ -222,8 +223,17 @@ void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const 
     enc->setBuffer(ids, ids_off, 4);
     if (kern.smem)
         enc->setThreadgroupMemoryLength(kern.smem, 0);
+    if (indirect)
+        enc->dispatchThreadgroups(indirect, indirect_off, MTL::Size(32, kern.nsg, 1));
+    else
+        enc->dispatchThreadgroups(indexed_grid(a), MTL::Size(32, kern.nsg, 1));
+}
+
+MTL::Size Gemv::indexed_grid(const Args& a)
+{
+    const Kernel& kern = kernel(a.type, a.k, 1, true);
     const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
-    enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, 1, a.batch), MTL::Size(32, kern.nsg, 1));
+    return MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, 1, a.batch);
 }
 
 } // namespace mako::mtl
