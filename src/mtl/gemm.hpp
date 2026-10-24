@@ -8,26 +8,28 @@
 
 namespace mako::mtl {
 
-// y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (prefill): tiles of weights dequantized to half and multiplied
-// with matmul2d, float accumulation. F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S and IQ3_XXS weights; k a multiple of 64.
+// y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (prefill), x in half: weights dequantized to half and multiplied
+// with matmul2d, float accumulation. F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S, IQ3_XXS and F16 weights; k a multiple of 32.
 class Gemm {
 public:
     explicit Gemm(const Context& ctx);
 
     static bool supports(gguf::Type type);
-    // On: activations stay float in the multiply (only weights become half); off: both half, faster.
-    void set_exact_activations(bool on) { exact_ = on; }
 
-    // y rows are ldy elements apart (0: n), x rows ldx (0: k; 16-byte aligned).
+    // y rows are ldy elements apart (0: n), x rows ldx (0: k); offsets in bytes.
     void encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
-                const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y,
+                const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* xh, uint64_t xh_off, const MTL::Buffer* y,
                 uint64_t y_off, uint32_t ldy = 0, uint32_t ldx = 0);
+    // xh = half(x) as dense rows of `cols`; x rows are ldx floats apart (0: cols).
+    void to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
+                 uint32_t ldx, const MTL::Buffer* xh, uint64_t xh_off);
 
 private:
+    MTL::ComputePipelineState* pso(const std::string& name);
+
     const Context& ctx_;
     Ref<MTL::Library> lib_;
     std::map<std::string, Ref<MTL::ComputePipelineState>> psos_;
-    bool exact_ = false;
 };
 
 } // namespace mako::mtl

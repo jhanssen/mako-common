@@ -1,6 +1,6 @@
-// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S, IQ3_XXS). Each threadgroup computes 64 tokens x 64 rows:
-// per 64-wide k step it dequantizes the weight tile and converts the activation tile to half in threadgroup
-// memory, and matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has them).
+// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S,
+// IQ3_XXS, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
+// them).
 #include <metal_stdlib>
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -12,6 +12,7 @@ using namespace mpp::tensor_ops;
 #define GGML_COMMON_IMPL_METAL
 #include "ggml-common.h"
 
+// attn_pv's tile.
 constant int TM = 64, TN = 64, TK = 64;
 
 struct GemmArgs {
@@ -108,89 +109,75 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
     }
 }
 
-// Threadgroups of 4 simdgroups (128 threads); grid (ceil(n / 64), ceil(t / 64)). k must be a multiple of 64.
-// X is the activation tile's type: half, or float to keep the activations exact (matmul2d takes float x half).
-template <int Type, typename X>
-kernel void gemm(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]], device float* y [[buffer(2)]],
+// Threadgroups of 4 simdgroups for 64 tokens x 32 rows; grid (ceil(n / 32), ceil(t / 64)). The half activations
+// go to matmul2d straight from device memory; the weights are dequantized 256 columns at a time into threadgroup
+// memory (fewer, longer matmul2d steps run much faster than 64-wide ones). k must be a multiple of 32.
+template <int Type>
+kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buffer(1)]], device float* y [[buffer(2)]],
                  constant GemmArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
                  ushort tid [[thread_index_in_threadgroup]])
 {
-    threadgroup X xs[TM * TK];
-    threadgroup half ws[TN * TK];
+    constexpr int TM = 64, TN = 32, KD = 256, NSG = 4;
+    threadgroup half ws[TN * KD];
     const uint n0 = tg.x * TN, t0 = tg.y * TM;
-    // Thread tid stages 32 values of tile row tid / 2 from column (tid % 2) * 32.
-    const uint r = tid / 2, c = (tid % 2) * 32;
-
-    tensor<threadgroup X, dextents<int32_t, 2>, tensor_inline> tx(xs, dextents<int32_t, 2>(TK, TM));
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(TK, TN));
-    constexpr auto desc = matmul2d_descriptor(TM, TN, TK, false, true, false,
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device half*>(x), dextents<int32_t, 2>(a.k, a.t),
+                                                                array<int32_t, 2>{1, int32_t(a.ldx)});
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(KD, TN));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, KD, false, true, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc, execution_simdgroups<4>> op;
-    auto acc = op.get_destination_cooperative_tensor<decltype(tx), decltype(tw), float>();
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto mx = tx.slice(0, int(t0));
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(tw), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] = 0.0f;
-
-    for (uint k = 0; k < a.k; k += TK) {
-        threadgroup X* xo = xs + r * TK + c;
-        if (t0 + r < a.t) {
-            device const float4* xp = reinterpret_cast<device const float4*>(x + uint64_t(t0 + r) * a.ldx + k + c);
-            for (short i = 0; i < 8; ++i) {
-                const float4 v = xp[i];
-                xo[4 * i] = X(v.x);
-                xo[4 * i + 1] = X(v.y);
-                xo[4 * i + 2] = X(v.z);
-                xo[4 * i + 3] = X(v.w);
+    for (uint k = 0; k < a.k; k += KD) {
+        // Each 32-wide piece of a weight row is staged by one thread; past k, zeros.
+        for (uint s = tid; s < TN * (KD / 32); s += NSG * 32) {
+            const uint r = s / (KD / 32), c = (s % (KD / 32)) * 32;
+            threadgroup half* wo = ws + r * KD + c;
+            if (n0 + r < a.n && k + c < a.k) {
+                dequant32<Type>(w + uint64_t(n0 + r) * a.row_bytes, k + c, wo);
+            } else {
+                for (short i = 0; i < 32; ++i)
+                    wo[i] = 0.0h;
             }
-        } else {
-            for (short i = 0; i < 32; ++i)
-                xo[i] = X(0);
-        }
-        threadgroup half* wo = ws + r * TK + c;
-        if (n0 + r < a.n) {
-            dequant32<Type>(w + uint64_t(n0 + r) * a.row_bytes, k + c, wo);
-        } else {
-            for (short i = 0; i < 32; ++i)
-                wo[i] = 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        op.run(tx, tw, acc);
+        auto xk = tx.slice(int(k), int(t0));
+        op.run(xk, tw, acc);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
     tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(y, dextents<int32_t, 2>(a.n, a.t),
                                                                  array<int32_t, 2>{1, int32_t(a.ldy)});
     acc.store(ty.slice(n0, t0));
 }
 
-template [[host_name("gemm_f32")]] kernel void gemm<F32, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_f32_x32")]] kernel void gemm<F32, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_q8_0")]] kernel void gemm<Q8_0, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_q8_0_x32")]] kernel void gemm<Q8_0, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_q6_k")]] kernel void gemm<Q6_K, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_q6_k_x32")]] kernel void gemm<Q6_K, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq2_xxs")]] kernel void gemm<IQ2_XXS, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq2_xxs_x32")]] kernel void gemm<IQ2_XXS, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq2_s")]] kernel void gemm<IQ2_S, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq2_s_x32")]] kernel void gemm<IQ2_S, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq3_xxs")]] kernel void gemm<IQ3_XXS, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq3_xxs_x32")]] kernel void gemm<IQ3_XXS, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_f16")]] kernel void gemm<F16, half>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_f16_x32")]] kernel void gemm<F16, float>(device const uchar*, device const float*,
-    device float*, constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f32")]] kernel void gemm<F32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q8_0")]] kernel void gemm<Q8_0>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q6_k")]] kernel void gemm<Q6_K>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xxs")]] kernel void gemm<IQ2_XXS>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_s")]] kernel void gemm<IQ2_S>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq3_xxs")]] kernel void gemm<IQ3_XXS>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f16")]] kernel void gemm<F16>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+
+// y[r][c] = half(x[r * ldx + c]), dense rows of `cols`; grid (cols, rows).
+struct HalfArgs {
+    uint cols, ldx;
+};
+kernel void to_half(device const float* x [[buffer(0)]], device half* y [[buffer(1)]], constant HalfArgs& a [[buffer(2)]],
+                    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.cols)
+        y[uint64_t(gid.y) * a.cols + gid.x] = half(x[uint64_t(gid.y) * a.ldx + gid.x]);
+}
 
 struct PvArgs {
     uint heads, dim, n_kv;
