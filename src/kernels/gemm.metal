@@ -109,15 +109,15 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
     }
 }
 
-// Threadgroups of 4 simdgroups for 64 tokens x 32 rows; grid (ceil(n / 32), ceil(t / 64)). The half activations
+// Threadgroups of 4 simdgroups for TM tokens x TN rows; grid (ceil(n / TN), ceil(t / TM)). The half activations
 // go to matmul2d straight from device memory; the weights are dequantized 256 columns at a time into threadgroup
 // memory (fewer, longer matmul2d steps run much faster than 64-wide ones). k must be a multiple of 32.
-template <int Type>
+template <int Type, int TM, int TN>
 kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buffer(1)]], device float* y [[buffer(2)]],
                  constant GemmArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
                  ushort tid [[thread_index_in_threadgroup]])
 {
-    constexpr int TM = 64, TN = 32, KD = 256, NSG = 4;
+    constexpr int KD = 256, NSG = 4;
     threadgroup half ws[TN * KD];
     const uint n0 = tg.x * TN, t0 = tg.y * TM;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device half*>(x), dextents<int32_t, 2>(a.k, a.t),
@@ -153,20 +153,35 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
     acc.store(ty.slice(n0, t0));
 }
 
-template [[host_name("gemm_f32")]] kernel void gemm<F32>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_f32_64x32")]] kernel void gemm<F32, 64, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_q8_0")]] kernel void gemm<Q8_0>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_f32_32x32")]] kernel void gemm<F32, 32, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_q6_k")]] kernel void gemm<Q6_K>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_q8_0_64x32")]] kernel void gemm<Q8_0, 64, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq2_xxs")]] kernel void gemm<IQ2_XXS>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_q8_0_32x32")]] kernel void gemm<Q8_0, 32, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq2_s")]] kernel void gemm<IQ2_S>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_q6_k_64x32")]] kernel void gemm<Q6_K, 64, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_iq3_xxs")]] kernel void gemm<IQ3_XXS>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_q6_k_32x32")]] kernel void gemm<Q6_K, 32, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
-template [[host_name("gemm_f16")]] kernel void gemm<F16>(device const uchar*, device const half*, device float*,
+template [[host_name("gemm_iq2_xxs_64x32")]] kernel void gemm<IQ2_XXS, 64, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xxs_32x32")]] kernel void gemm<IQ2_XXS, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_s_64x32")]] kernel void gemm<IQ2_S, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_s_32x32")]] kernel void gemm<IQ2_S, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq3_xxs_64x32")]] kernel void gemm<IQ3_XXS, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq3_xxs_32x32")]] kernel void gemm<IQ3_XXS, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f16_64x32")]] kernel void gemm<F16, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f16_32x32")]] kernel void gemm<F16, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+
 
 // y[r][c] = half(x[r * ldx + c]), dense rows of `cols`; grid (cols, rows).
 struct HalfArgs {

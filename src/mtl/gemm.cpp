@@ -51,12 +51,14 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
         throw std::runtime_error(std::format("no GEMM for {} with k={}", gguf::traits(type).name, k));
     const auto tr = gguf::traits(type);
     const GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes), ldy ? ldy : n, ldx ? ldx : k};
-    enc->setComputePipelineState(pso(name));
+    // Tiles of 64 tokens, or 32 where that pads less (an expert's share of a chunk is often under 32 tokens).
+    const uint32_t tm = (t + 31) / 32 * 32 < (t + 63) / 64 * 64 ? 32 : 64, tn = 32;
+    enc->setComputePipelineState(pso(std::format("{}_{}x{}", name, tm, tn)));
     enc->setBuffer(w, w_off, 0);
     enc->setBuffer(xh, xh_off, 1);
     enc->setBuffer(y, y_off, 2);
     enc->setBytes(&a, sizeof(a), 3);
-    enc->dispatchThreadgroups(MTL::Size((n + 31) / 32, (t + 63) / 64, 1), MTL::Size(128, 1, 1));
+    enc->dispatchThreadgroups(MTL::Size((n + tn - 1) / tn, (t + tm - 1) / tm, 1), MTL::Size(128, 1, 1));
 }
 
 void Gemm::to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
