@@ -82,9 +82,38 @@ bool is_iq(gguf::Type t)
     return t == Type::IQ3_S || t == Type::IQ3_XXS || t == Type::IQ2_S || t == Type::IQ2_XS || t == Type::IQ2_XXS;
 }
 
+// Layout must match ShortArgs in gemv.metal.
+struct ShortArgs {
+    uint32_t k, n, row_bytes;
+};
+
 } // namespace
 
-Gemv::Gemv(const Context& ctx) : ctx_(ctx), lib_(ctx.load(gemv_metallib())) {}
+Gemv::Gemv(const Context& ctx) : ctx_(ctx), lib_(ctx.load(gemv_metallib())), own_lib_(ctx.load(kernels_metallib())) {}
+
+MTL::ComputePipelineState* Gemv::own(const std::string& name)
+{
+    auto it = own_psos_.find(name);
+    if (it == own_psos_.end())
+        it = own_psos_.emplace(name, ctx_.pipeline(own_lib_.get(), name)).first;
+    return it->second.get();
+}
+
+bool Gemv::encode_short(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
+                        const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off)
+{
+    const bool q8 = a.type == gguf::Type::Q8_0;
+    if (!own_kernels_ || (!q8 && a.type != gguf::Type::F32) || a.batch != 1 || a.t != 1 || a.k % 32 || a.k > 512)
+        return false;
+    const ShortArgs sa{a.k, a.n, uint32_t(row_bytes(a.type, a.k))};
+    enc->setComputePipelineState(own(q8 ? "gemv_short_q8_0" : "gemv_short_f32"));
+    enc->setBuffer(w, w_off, 0);
+    enc->setBuffer(x, x_off, 1);
+    enc->setBuffer(y, y_off, 2);
+    enc->setBytes(&sa, sizeof(sa), 3);
+    enc->dispatchThreadgroups(MTL::Size((a.n + 63) / 64, 1, 1), MTL::Size(256, 1, 1));
+    return true;
+}
 
 bool Gemv::supports(gguf::Type type) { return type == gguf::Type::F32 || info(type) != nullptr; }
 
@@ -141,6 +170,8 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
 void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                   const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off)
 {
+    if (encode_short(enc, a, w, w_off, x, x_off, y, y_off))
+        return;
     if (is_iq(a.type) && a.k < 1024)
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
     if (a.batch > 32767)
