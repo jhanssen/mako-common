@@ -1,4 +1,4 @@
-// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens. Each threadgroup computes 64 tokens x 64 rows:
+// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S, IQ3_XXS). Each threadgroup computes 64 tokens x 64 rows:
 // per 64-wide k step it dequantizes the weight tile and converts the activation tile to half in threadgroup
 // memory, and matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has them).
 #include <metal_stdlib>
@@ -7,6 +7,11 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
+// Block layouts and the IQ grid/sign tables, from the pinned per-format kernel headers.
+#define GGML_COMMON_DECL_METAL
+#define GGML_COMMON_IMPL_METAL
+#include "ggml-common.h"
+
 constant int TM = 64, TN = 64, TK = 64;
 
 struct GemmArgs {
@@ -14,7 +19,14 @@ struct GemmArgs {
     uint ldy; // y row stride in elements
 };
 
-enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2 };
+enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5 };
+
+// 8 weights from a grid entry (8 or 4 bytes per entry), signs from bit i of sb, times dl.
+static void grid8(constant uchar* g, uint sb, float dl, threadgroup half* out)
+{
+    for (short i = 0; i < 8; ++i)
+        out[i] = half(dl * float(g[i]) * ((sb >> i) & 1 ? -1.0f : 1.0f));
+}
 
 // Writes 32 weights of `row` starting at k0 (a multiple of 32) to out.
 template <int Type>
@@ -35,6 +47,44 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
         device const char* q = reinterpret_cast<device const char*>(blk + 2);
         for (short i = 0; i < 32; ++i)
             out[i] = half(d * float(q[i]));
+    } else if (Type == IQ2_XXS) {
+        // Per 32: four grid indices, then four 7-bit sign indices and a 4-bit scale.
+        device const block_iq2_xxs* blk = reinterpret_cast<device const block_iq2_xxs*>(row) + k0 / 256;
+        device const ushort* q2 = blk->qs + 4 * ((k0 % 256) / 32);
+        const uint idx = uint(q2[0]) | (uint(q2[1]) << 16), aux = uint(q2[2]) | (uint(q2[3]) << 16);
+        const float dl = float(blk->d) * (0.5f + float(aux >> 28)) * 0.25f;
+        for (short l = 0; l < 4; ++l)
+            grid8(reinterpret_cast<constant uchar*>(iq2xxs_grid + ((idx >> (8 * l)) & 255)),
+                  ksigns_iq2xs[(aux >> (7 * l)) & 127], dl, out + 8 * l);
+    } else if (Type == IQ2_S) {
+        // Per 32: four index bytes with two high bits each in qh, four sign bytes, a 4-bit scale per 16.
+        device const block_iq2_s* blk = reinterpret_cast<device const block_iq2_s*>(row) + k0 / 256;
+        const uint ib = (k0 % 256) / 32, qh = blk->qh[ib];
+        device const uchar* qs = blk->qs + 4 * ib;
+        device const uchar* sg = blk->qs + 32 + 4 * ib;
+        const float d = float(blk->d);
+        for (short l = 0; l < 4; ++l) {
+            const float dl = d * (0.5f + float((blk->scales[ib] >> (4 * (l / 2))) & 0xf)) * 0.25f;
+            grid8(reinterpret_cast<constant uchar*>(iq2s_grid + (qs[l] | (((qh >> (2 * l)) & 3) << 8))), sg[l], dl,
+                  out + 8 * l);
+        }
+    } else if (Type == IQ3_XXS) {
+        // Per 32: eight 4-weight grid indices, then four 7-bit sign indices and a 4-bit scale.
+        device const block_iq3_xxs* blk = reinterpret_cast<device const block_iq3_xxs*>(row) + k0 / 256;
+        const uint ib = (k0 % 256) / 32;
+        device const uchar* q3 = blk->qs + 8 * ib;
+        device const ushort* gas = reinterpret_cast<device const ushort*>(blk->qs + 64) + 2 * ib;
+        const uint aux = uint(gas[0]) | (uint(gas[1]) << 16);
+        const float dl = float(blk->d) * (0.5f + float(aux >> 28)) * 0.5f;
+        for (short l = 0; l < 4; ++l) {
+            const uint sb = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+            constant uchar* g1 = reinterpret_cast<constant uchar*>(iq3xxs_grid + q3[2 * l]);
+            constant uchar* g2 = reinterpret_cast<constant uchar*>(iq3xxs_grid + q3[2 * l + 1]);
+            for (short i = 0; i < 4; ++i) {
+                out[8 * l + i] = half(dl * float(g1[i]) * ((sb >> i) & 1 ? -1.0f : 1.0f));
+                out[8 * l + 4 + i] = half(dl * float(g2[i]) * ((sb >> (i + 4)) & 1 ? -1.0f : 1.0f));
+            }
+        }
     } else {
         // Q6_K, 210 bytes per 256: ql[128] low nibbles, qh[64] high pairs, scales[16], d. The 32 weights at
         // k0 share half n, quarter qt: low or high nibbles of ql, bit pair qt of qh, scales by 16.
@@ -112,3 +162,9 @@ template [[host_name("gemm_q8_0")]] kernel void gemm<Q8_0>(device const uchar*, 
                                                            constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_q6_k")]] kernel void gemm<Q6_K>(device const uchar*, device const float*, device float*,
                                                            constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xxs")]] kernel void gemm<IQ2_XXS>(device const uchar*, device const float*,
+                                                                 device float*, constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_s")]] kernel void gemm<IQ2_S>(device const uchar*, device const float*, device float*,
+                                                             constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq3_xxs")]] kernel void gemm<IQ3_XXS>(device const uchar*, device const float*,
+                                                                 device float*, constant GemmArgs&, uint2, ushort);
