@@ -41,7 +41,8 @@ public:
     // y[i] = W[ids[i]] x_i for i < a.batch (t = 1), with matrix s at w + w_off + s * stride and int32 ids read by
     // the GPU; x_i is x when a.x_shared, else row i of x. With `indirect`, the threadgroup grid is read from it
     // (MTLDispatchThreadgroupsIndirectArguments): x and y as indexed_grid() gives them, z the number of ids to run.
-    // Matrices s >= tail.split are at tail.buf + tail.off + (s - split) * stride instead.
+    // Matrices s >= tail.split are at tail.buf + tail.off + (s - split) * stride instead; with tail.buf null (the
+    // arena's lendable slots lent) no id may reach split.
     using Tail = GemvTail;
     void encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                         uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x, uint64_t x_off,

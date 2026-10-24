@@ -221,8 +221,6 @@ void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const 
                           uint64_t x_off, const MTL::Buffer* y, uint64_t y_off, const MTL::Buffer* indirect,
                           uint64_t indirect_off, const Tail& tail)
 {
-    if (tail.split != UINT32_MAX && !tail.buf)
-        throw std::runtime_error("indexed GEMV over lent expert slots");
     if (is_iq(a.type) && a.k < 1024)
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
     Kernel& kern = kernel(a.type, a.k, 1, true);
