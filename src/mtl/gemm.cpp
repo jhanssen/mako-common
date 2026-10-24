@@ -1,0 +1,53 @@
+#include "mtl/gemm.hpp"
+
+#include "mtl/embedded.hpp"
+
+#include <format>
+#include <stdexcept>
+
+namespace mako::mtl {
+
+namespace {
+
+// Layout must match GemmArgs in gemm.metal.
+struct GemmArgs {
+    uint32_t t, k, n, row_bytes;
+};
+
+const char* kernel_name(gguf::Type type)
+{
+    switch (type) {
+    case gguf::Type::F32: return "gemm_f32";
+    case gguf::Type::Q8_0: return "gemm_q8_0";
+    case gguf::Type::Q6_K: return "gemm_q6_k";
+    default: return nullptr;
+    }
+}
+
+} // namespace
+
+Gemm::Gemm(const Context& ctx) : ctx_(ctx), lib_(ctx.load(kernels_metallib())) {}
+
+bool Gemm::supports(gguf::Type type) { return kernel_name(type) != nullptr; }
+
+void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
+                  const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y,
+                  uint64_t y_off)
+{
+    const char* name = kernel_name(type);
+    if (!name || k % 64)
+        throw std::runtime_error(std::format("no GEMM for {} with k={}", gguf::traits(type).name, k));
+    auto it = psos_.find(name);
+    if (it == psos_.end())
+        it = psos_.emplace(name, ctx_.pipeline(lib_.get(), name)).first;
+    const auto tr = gguf::traits(type);
+    const GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes)};
+    enc->setComputePipelineState(it->second.get());
+    enc->setBuffer(w, w_off, 0);
+    enc->setBuffer(x, x_off, 1);
+    enc->setBuffer(y, y_off, 2);
+    enc->setBytes(&a, sizeof(a), 3);
+    enc->dispatchThreadgroups(MTL::Size((n + 63) / 64, (t + 63) / 64, 1), MTL::Size(128, 1, 1));
+}
+
+} // namespace mako::mtl
