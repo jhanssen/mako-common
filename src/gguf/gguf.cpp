@@ -45,6 +45,7 @@ TypeTraits traits(Type t)
     case Type::TQ1_0: return {"TQ1_0", 256, 54};
     case Type::TQ2_0: return {"TQ2_0", 256, 66};
     case Type::MXFP4: return {"MXFP4", 32, 17};
+    case Type::MXFP8: return {"MXFP8", 32, 33};
     }
     return {"?", 0, 0};
 }

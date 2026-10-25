@@ -46,6 +46,7 @@ enum class Type : uint32_t {
     TQ1_0 = 34,
     TQ2_0 = 35,
     MXFP4 = 39,
+    MXFP8 = 43, // a scale byte (E8M0) then 32 E4M3 codes
 };
 
 struct TypeTraits {
