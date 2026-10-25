@@ -79,10 +79,11 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
                     type == gguf::Type::IQ3_S;
     if (iq && t <= 16)
         tm = 16; // the matrix work of a 32-token tile, not the dequantization, dominates at few tokens
-    // 128-token tiles dequantize each weight half as often as 64-token ones; used where they pad no more.
-    if (iq && t > 64 && (t + 127) / 128 * 128 <= (t + 63) / 64 * 64)
+    // 128- and 256-token tiles dequantize each weight half / a quarter as often as 64-token ones; used where they pad
+    // no more.
+    if (t > 64 && (t + 127) / 128 * 128 <= (t + 63) / 64 * 64)
         tm = 128;
-    if (iq && t > 128 && (t + 255) / 256 * 256 <= (t + 127) / 128 * 128)
+    if (t > 128 && (t + 255) / 256 * 256 <= (t + 127) / 128 * 128)
         tm = 256;
     enc->setComputePipelineState(pso(std::format("{}_{}x{}", name, tm, tn)));
     enc->setBuffer(w, w_off, 0);

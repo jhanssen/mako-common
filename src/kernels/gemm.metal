@@ -369,6 +369,22 @@ template [[host_name("gemm_iq3_xxs_256x32")]] kernel void gemm<IQ3_XXS, 256, 32>
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_iq3_s_256x32")]] kernel void gemm<IQ3_S, 256, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f32_128x32")]] kernel void gemm<F32, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f32_256x32")]] kernel void gemm<F32, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q8_0_128x32")]] kernel void gemm<Q8_0, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q8_0_256x32")]] kernel void gemm<Q8_0, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q6_k_128x32")]] kernel void gemm<Q6_K, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q6_k_256x32")]] kernel void gemm<Q6_K, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f16_128x32")]] kernel void gemm<F16, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_f16_256x32")]] kernel void gemm<F16, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_f16_64x32")]] kernel void gemm<F16, 64, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_f16_32x32")]] kernel void gemm<F16, 32, 32>(device const uchar*, device const half*, device float*,
