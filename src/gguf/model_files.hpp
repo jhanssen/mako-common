@@ -2,6 +2,7 @@
 
 #include "gguf/gguf.hpp"
 
+#include <deque>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -23,12 +24,12 @@ public:
     std::expected<void, std::string> add(const std::string& path);
 
     const File& meta() const { return files_.front(); }
-    const std::vector<File>& files() const { return files_; }
+    const std::deque<File>& files() const { return files_; }
     Ref find(std::string_view name) const;
     uint64_t tensor_count() const;
 
 private:
-    std::vector<File> files_;
+    std::deque<File> files_; // (a deque: add() leaves references to the others valid)
 };
 
 } // namespace mako::gguf
