@@ -23,6 +23,7 @@ const char* kernel_name(gguf::Type type)
     case gguf::Type::IQ2_XXS: return "gemm_iq2_xxs";
     case gguf::Type::IQ2_S: return "gemm_iq2_s";
     case gguf::Type::IQ3_XXS: return "gemm_iq3_xxs";
+    case gguf::Type::IQ3_S: return "gemm_iq3_s";
     case gguf::Type::F16: return "gemm_f16";
     default: return nullptr;
     }
@@ -74,7 +75,9 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
     }
     // Tiles of 64 tokens, or 32 where that pads less (an expert's share of a chunk is often under 32 tokens).
     uint32_t tm = (t + 31) / 32 * 32 < (t + 63) / 64 * 64 ? 32 : 64, tn = 32;
-    if (few_name(type) && t <= 16)
+    const bool iq = type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ2_S || type == gguf::Type::IQ3_XXS ||
+                    type == gguf::Type::IQ3_S;
+    if (iq && t <= 16)
         tm = 16; // the matrix work of a 32-token tile, not the dequantization, dominates at few tokens
     enc->setComputePipelineState(pso(std::format("{}_{}x{}", name, tm, tn)));
     enc->setBuffer(w, w_off, 0);

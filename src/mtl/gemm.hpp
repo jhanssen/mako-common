@@ -9,7 +9,7 @@
 namespace mako::mtl {
 
 // y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (prefill), x in half: weights dequantized to half and multiplied
-// with matmul2d, float accumulation. F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S, IQ3_XXS and F16 weights; k a multiple of 32.
+// with matmul2d, float accumulation. F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and F16 weights; k a multiple of 32.
 class Gemm {
 public:
     explicit Gemm(const Context& ctx);
