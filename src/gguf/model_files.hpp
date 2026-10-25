@@ -19,6 +19,8 @@ public:
     };
 
     static std::expected<ModelFiles, std::string> open(const std::string& first_shard);
+    // Adds one more GGUF (tensors kept elsewhere, such as a separate set of tables); find() searches it too.
+    std::expected<void, std::string> add(const std::string& path);
 
     const File& meta() const { return files_.front(); }
     const std::vector<File>& files() const { return files_; }

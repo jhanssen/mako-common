@@ -38,6 +38,15 @@ std::expected<ModelFiles, std::string> ModelFiles::open(const std::string& first
     return m;
 }
 
+std::expected<void, std::string> ModelFiles::add(const std::string& path)
+{
+    auto f = File::open(path);
+    if (!f)
+        return std::unexpected(f.error());
+    files_.push_back(std::move(*f));
+    return {};
+}
+
 ModelFiles::Ref ModelFiles::find(std::string_view name) const
 {
     for (const auto& f : files_)
