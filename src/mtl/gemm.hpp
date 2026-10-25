@@ -15,6 +15,8 @@ public:
     explicit Gemm(const Context& ctx);
 
     static bool supports(gguf::Type type);
+    // Up to this many tokens, IQ2_XXS, IQ2_S and IQ3_XXS weights use the few-token kernel (0: never).
+    void set_few_tokens(uint32_t t) { few_tokens_ = t; }
 
     // y rows are ldy elements apart (0: n), x rows ldx (0: k); offsets in bytes.
     void encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
@@ -30,6 +32,9 @@ private:
     const Context& ctx_;
     Ref<MTL::Library> lib_;
     std::map<std::string, Ref<MTL::ComputePipelineState>> psos_;
+    // Off: its rounding differs from the tiled kernel's, so a token's result would depend on how many others share
+    // its expert (a prompt split differently would no longer give the same logits). Faster up to 2 tokens.
+    uint32_t few_tokens_ = 0;
 };
 
 } // namespace mako::mtl

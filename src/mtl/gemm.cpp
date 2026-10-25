@@ -32,6 +32,16 @@ const char* kernel_name(gguf::Type type)
 
 Gemm::Gemm(const Context& ctx) : ctx_(ctx), lib_(ctx.load(kernels_metallib())) {}
 
+const char* few_name(gguf::Type type)
+{
+    switch (type) {
+    case gguf::Type::IQ2_XXS: return "gemm_few_iq2_xxs";
+    case gguf::Type::IQ2_S: return "gemm_few_iq2_s";
+    case gguf::Type::IQ3_XXS: return "gemm_few_iq3_xxs";
+    default: return nullptr;
+    }
+}
+
 bool Gemm::supports(gguf::Type type) { return kernel_name(type) != nullptr; }
 
 MTL::ComputePipelineState* Gemm::pso(const std::string& name)
@@ -51,8 +61,21 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
         throw std::runtime_error(std::format("no GEMM for {} with k={}", gguf::traits(type).name, k));
     const auto tr = gguf::traits(type);
     const GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes), ldy ? ldy : n, ldx ? ldx : k};
+    if (const char* few = few_name(type); few && t <= few_tokens_) {
+        // Weights dequantized once per pass of up to 4 tokens, in registers; 16 rows per threadgroup.
+        const uint32_t nt = t <= 1 ? 1 : t <= 2 ? 2 : 4;
+        enc->setComputePipelineState(pso(std::format("{}_{}", few, nt)));
+        enc->setBuffer(w, w_off, 0);
+        enc->setBuffer(xh, xh_off, 1);
+        enc->setBuffer(y, y_off, 2);
+        enc->setBytes(&a, sizeof(a), 3);
+        enc->dispatchThreadgroups(MTL::Size((n + 15) / 16, 1, 1), MTL::Size(128, 1, 1));
+        return;
+    }
     // Tiles of 64 tokens, or 32 where that pads less (an expert's share of a chunk is often under 32 tokens).
-    const uint32_t tm = (t + 31) / 32 * 32 < (t + 63) / 64 * 64 ? 32 : 64, tn = 32;
+    uint32_t tm = (t + 31) / 32 * 32 < (t + 63) / 64 * 64 ? 32 : 64, tn = 32;
+    if (few_name(type) && t <= 16)
+        tm = 16; // the matrix work of a 32-token tile, not the dequantization, dominates at few tokens
     enc->setComputePipelineState(pso(std::format("{}_{}x{}", name, tm, tn)));
     enc->setBuffer(w, w_off, 0);
     enc->setBuffer(xh, xh_off, 1);
