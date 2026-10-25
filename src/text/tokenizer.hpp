@@ -13,7 +13,8 @@
 
 namespace mako::text {
 
-// Byte-level BPE as described by a GGUF's tokenizer.ggml.* metadata (model "gpt2").
+// Byte-level BPE as described by a GGUF's tokenizer.ggml.* metadata (model "gpt2"; GLM's and DeepSeek-V3's
+// pre-tokenizers).
 class Tokenizer {
 public:
     enum class TokenType : int32_t { Normal = 1, Unknown = 2, Control = 3, UserDefined = 4, Unused = 5, Byte = 6 };
@@ -46,6 +47,7 @@ private:
     std::unordered_map<std::string, int32_t> merge_rank_;  // "left right" -> rank
     std::vector<int32_t> specials_;                        // longest text first
     bool ignore_merges_ = false;
+    bool deepseek_ = false; // DeepSeek-V3's pre-tokenizer, else GLM's
     int32_t eos_ = -1, eot_ = -1;
 };
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <format>
 #include <limits>
 #include <variant>
@@ -25,6 +26,9 @@ bool in_ranges(const CodepointRange (&r)[N], uint32_t cp)
 
 bool is_letter(uint32_t cp) { return in_ranges(kLetterRanges, cp); }
 bool is_number(uint32_t cp) { return in_ranges(kNumberRanges, cp); }
+bool is_punct(uint32_t cp) { return in_ranges(kPunctRanges, cp); }
+bool is_symbol(uint32_t cp) { return in_ranges(kSymbolRanges, cp); }
+bool is_mark(uint32_t cp) { return in_ranges(kMarkRanges, cp); }
 
 // The Unicode White_Space property.
 bool is_space(uint32_t cp)
@@ -187,6 +191,111 @@ std::vector<size_t> split_lengths(const std::vector<uint32_t>& c)
     return out;
 }
 
+// Lengths of the DeepSeek-V3 pre-tokenizer's pieces, in code points. Three patterns split in turn, each within the
+// pieces the one before left (matches and the text between them alike):
+//   \pN{1,3}
+//   [\x{4E00}-\x{9FA5}\x{3040}-\x{30FF}]+
+//   [ASCII punctuation][A-Za-z]+ | [^\r\n\pL\pP\pS]?[\pL\pM]+ | ' '?[\pP\pS]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+std::vector<size_t> split_lengths_deepseek3(const std::vector<uint32_t>& c)
+{
+    using Piece = std::pair<size_t, size_t>; // [begin, end)
+    // The pieces of each of `in` by `match` (the length of a match at i within [i, end), 0 for none): matches and the
+    // runs between them, leftmost first.
+    auto apply = [](const std::vector<Piece>& in, auto&& match) {
+        std::vector<Piece> out;
+        for (auto [b, e] : in) {
+            size_t gap = b;
+            for (size_t i = b; i < e;) {
+                if (const size_t len = match(i, e)) {
+                    if (gap < i)
+                        out.emplace_back(gap, i);
+                    out.emplace_back(i, i + len);
+                    i += len;
+                    gap = i;
+                } else {
+                    ++i;
+                }
+            }
+            if (gap < e)
+                out.emplace_back(gap, e);
+        }
+        return out;
+    };
+    std::vector<Piece> pieces{{0, c.size()}};
+    pieces = apply(pieces, [&](size_t i, size_t e) {
+        size_t j = i;
+        while (j < e && j < i + 3 && is_number(c[j]))
+            ++j;
+        return j - i;
+    });
+    pieces = apply(pieces, [&](size_t i, size_t e) {
+        auto cjk = [&](uint32_t cp) { return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x30FF); };
+        size_t j = i;
+        while (j < e && cjk(c[j]))
+            ++j;
+        return j - i;
+    });
+    pieces = apply(pieces, [&](size_t i, size_t e) -> size_t {
+        auto at = [&](size_t k) { return k < e; };
+        auto ascii_letter = [&](size_t k) { return at(k) && c[k] < 0x80 && std::isalpha(int(c[k])); };
+        auto ascii_punct = [&](size_t k) { return at(k) && c[k] < 0x80 && std::ispunct(int(c[k])); };
+        auto lm = [&](size_t k) { return at(k) && (is_letter(c[k]) || is_mark(c[k])); };
+        auto ps = [&](size_t k) { return at(k) && (is_punct(c[k]) || is_symbol(c[k])); };
+        auto space = [&](size_t k) { return at(k) && is_space(c[k]); };
+        if (ascii_punct(i) && ascii_letter(i + 1)) {
+            size_t j = i + 1;
+            while (ascii_letter(j))
+                ++j;
+            return j - i;
+        }
+        {
+            size_t j = i;
+            if (!is_newline(c[i]) && !is_letter(c[i]) && !is_punct(c[i]) && !is_symbol(c[i]) && lm(i + 1))
+                ++j;
+            if (lm(j)) {
+                while (lm(j))
+                    ++j;
+                return j - i;
+            }
+        }
+        {
+            size_t j = i;
+            if (c[j] == ' ' && ps(j + 1))
+                ++j;
+            if (ps(j)) {
+                while (ps(j))
+                    ++j;
+                while (at(j) && is_newline(c[j]))
+                    ++j;
+                return j - i;
+            }
+        }
+        if (space(i)) {
+            size_t end = i;
+            while (space(end))
+                ++end;
+            size_t last_nl = e;
+            for (size_t j = i; j < end; ++j)
+                if (is_newline(c[j]))
+                    last_nl = j;
+            if (last_nl != e) {
+                size_t j = last_nl + 1;
+                while (at(j) && is_newline(c[j]))
+                    ++j;
+                return j - i;
+            }
+            if (end == e)
+                return end - i;
+            return end - i >= 2 ? end - i - 1 : 1;
+        }
+        return 0;
+    });
+    std::vector<size_t> out;
+    for (auto [b, e] : pieces)
+        out.push_back(e - b);
+    return out;
+}
+
 const gguf::Array* array_of(const gguf::File& f, std::string_view key)
 {
     const gguf::Value* v = f.find(key);
@@ -200,7 +309,8 @@ std::expected<Tokenizer, std::string> Tokenizer::load(const gguf::File& meta)
     if (meta.get_string("tokenizer.ggml.model").value_or("") != "gpt2")
         return std::unexpected("tokenizer model is not byte-level BPE");
     const auto pre = meta.get_string("tokenizer.ggml.pre").value_or("");
-    if (pre != "glm4" && pre != "glm5")
+    const bool deepseek = pre == "joyai-llm" || pre == "deepseek-v3";
+    if (pre != "glm4" && pre != "glm5" && !deepseek)
         return std::unexpected(std::format("unsupported pre-tokenizer '{}'", pre));
 
     const gguf::Array* tokens = array_of(meta, "tokenizer.ggml.tokens");
@@ -210,7 +320,8 @@ std::expected<Tokenizer, std::string> Tokenizer::load(const gguf::File& meta)
         return std::unexpected("tokenizer vocabulary missing or inconsistent");
 
     Tokenizer t;
-    t.ignore_merges_ = true;
+    t.deepseek_ = deepseek;
+    t.ignore_merges_ = !deepseek; // the vocabulary's whole-word entries win over the merges only for GLM's
     t.tokens_.reserve(tokens->items.size());
     for (size_t i = 0; i < tokens->items.size(); ++i) {
         const auto* s = std::get_if<std::string>(&tokens->items[i]);
@@ -256,7 +367,7 @@ std::vector<std::string> Tokenizer::split(std::string_view text) const
     decode_utf8(text, cps, offs);
     std::vector<std::string> out;
     size_t at = 0;
-    for (size_t len : split_lengths(cps)) {
+    for (size_t len : deepseek_ ? split_lengths_deepseek3(cps) : split_lengths(cps)) {
         out.emplace_back(text.substr(offs[at], offs[at + len] - offs[at]));
         at += len;
     }
