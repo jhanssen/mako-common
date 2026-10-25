@@ -20,6 +20,8 @@ const char* kernel_name(gguf::Type type)
     case gguf::Type::F32: return "gemm_f32";
     case gguf::Type::Q8_0: return "gemm_q8_0";
     case gguf::Type::Q6_K: return "gemm_q6_k";
+    case gguf::Type::Q4_K: return "gemm_q4_k";
+    case gguf::Type::Q5_K: return "gemm_q5_k";
     case gguf::Type::IQ2_XXS: return "gemm_iq2_xxs";
     case gguf::Type::IQ2_S: return "gemm_iq2_s";
     case gguf::Type::IQ3_XXS: return "gemm_iq3_xxs";

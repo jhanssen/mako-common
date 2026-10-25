@@ -1,4 +1,4 @@
-// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, IQ2_XXS, IQ2_S,
+// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ2_XXS, IQ2_S,
 // IQ3_XXS, IQ3_S, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
 // them).
 #include <metal_stdlib>
@@ -21,7 +21,7 @@ struct GemmArgs {
     uint ldx; // x row stride in elements
 };
 
-enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7 };
+enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9 };
 
 // 8 weights from a grid entry (8 or 4 bytes per entry), signs from bit i of sb, times dl.
 static void grid8(constant uchar* g, uint sb, float dl, threadgroup half* out)
@@ -105,6 +105,25 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
                 out[8 * l + i] = half(dl * float(g1[i]) * ((sg[l] >> i) & 1 ? -1.0f : 1.0f));
                 out[8 * l + 4 + i] = half(dl * float(g2[i]) * ((sg[l] >> (i + 4)) & 1 ? -1.0f : 1.0f));
             }
+        }
+    } else if (Type == Q4_K || Type == Q5_K) {
+        // Per 256: d, dmin, 6-bit scales and mins of 8 sub-blocks of 32, (Q5_K) 32 bytes of fifth bits, then the
+        // nibbles: sub-block j is the low (j even) or high nibbles of bytes 32 * (j / 2)..; its fifth bit is bit j.
+        constexpr uint bytes = Type == Q4_K ? 144 : 176;
+        device const uchar* blk = row + (k0 / 256) * bytes;
+        const uint j = (k0 % 256) / 32;
+        device const uchar* sc = blk + 4;
+        const uint s = j < 4 ? (sc[j] & 63) : ((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4));
+        const uint m = j < 4 ? (sc[j + 4] & 63) : ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4));
+        const float d = float(*reinterpret_cast<device const half*>(blk)) * float(s);
+        const float dm = float(*reinterpret_cast<device const half*>(blk + 2)) * float(m);
+        device const uchar* qh = blk + 16;
+        device const uchar* ql = blk + (Type == Q4_K ? 16 : 48) + 32 * (j / 2);
+        for (short l = 0; l < 32; ++l) {
+            uint q = (j & 1) ? (ql[l] >> 4) : (ql[l] & 0xF);
+            if (Type == Q5_K)
+                q |= ((qh[l] >> j) & 1) << 4;
+            out[l] = half(d * float(q) - dm);
         }
     } else {
         // Q6_K, 210 bytes per 256: ql[128] low nibbles, qh[64] high pairs, scales[16], d. The 32 weights at
@@ -384,6 +403,22 @@ template [[host_name("gemm_q6_k_256x32")]] kernel void gemm<Q6_K, 256, 32>(devic
 template [[host_name("gemm_f16_128x32")]] kernel void gemm<F16, 128, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_f16_256x32")]] kernel void gemm<F16, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q4_k_32x32")]] kernel void gemm<Q4_K, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q4_k_64x32")]] kernel void gemm<Q4_K, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q4_k_128x32")]] kernel void gemm<Q4_K, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q4_k_256x32")]] kernel void gemm<Q4_K, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q5_k_32x32")]] kernel void gemm<Q5_K, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q5_k_64x32")]] kernel void gemm<Q5_K, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q5_k_128x32")]] kernel void gemm<Q5_K, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_q5_k_256x32")]] kernel void gemm<Q5_K, 256, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_f16_64x32")]] kernel void gemm<F16, 64, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
