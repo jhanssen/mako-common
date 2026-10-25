@@ -150,12 +150,13 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
         kern.smem = ti->smem;
         kern.rows_per_sg_grid = ti->rows_per_sg_grid;
     }
-    // mako's IQ2_XXS kernel: the per-format kernel's results, faster (grid table as half).
-    const bool own_iq = own_kernels_ && tokens == 1 && type == gguf::Type::IQ2_XXS;
+    // mako's IQ2_XXS / IQ3_XXS kernels, faster (grid tables as half): IQ2_XXS gives the per-format kernel's results bit
+    // for bit, IQ3_XXS rounds differently (~1e-7 relative).
+    const bool own_iq = own_kernels_ && tokens == 1 && (type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ3_XXS);
     if (own_iq) {
         kern.nr0 = 4;
-        name = "mako_mul_mv_iq2_xxs_f32_r4";
-        kern.smem = 256 * 16 + 128;
+        name = type == gguf::Type::IQ2_XXS ? "mako_mul_mv_iq2_xxs_f32_r4" : "mako_mul_mv_iq3_xxs_f32_r4";
+        kern.smem = type == gguf::Type::IQ2_XXS ? 256 * 16 + 128 : 256 * 8 + 128;
     }
 
     if (indexed && own_iq)
