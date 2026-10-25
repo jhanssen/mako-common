@@ -129,3 +129,86 @@ SLOTS("iq2_s_f32", kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>)
 SLOTS("iq3_xxs_f32", kernel_mul_mv_iq3_xxs_f32_disp<ggml_metal_kargs_mul_mv>)
 SLOTS("iq3_s_f32", kernel_mul_mv_iq3_s_f32_disp<ggml_metal_kargs_mul_mv>)
 SLOTS("iq4_xs_f32", kernel_mul_mv_iq4_xs_f32_impl<N_R0_IQ4_XS>)
+
+// IQ2_XXS rows with the per-format kernel's layout and each lane's summation order (the same results, bit for bit),
+// but the grid entries converted to half once per threadgroup (eight weights are two loads instead of eight byte
+// loads and conversions) and the signs applied by negation. Two simdgroups of nr0 rows each.
+template <int nr0, typename args_t>
+void mako_iq2_xxs_impl(args_t args, device const char* src0, device const char* src1, device char* dst,
+                       threadgroup char* shmem, uint3 tgpig, ushort tiisg, ushort sgitg)
+{
+    const short NSG = FC_mul_mv_nsg;
+    const int nb32 = args.ne00 / 32;
+    const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+    const uint im = tgpig.z, i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const uint64_t offset0 = first_row * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 + (i13 / FC_mul_mv_r3) * args.nb03;
+    const uint64_t offset1 = tgpig.y * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const block_iq2_xxs* x = (device const block_iq2_xxs*)(src0 + offset0);
+    device const float4* y4 = (device const float4*)(src1 + offset1) + 8 * tiisg;
+
+    threadgroup half4* sgrid = (threadgroup half4*)shmem; // 256 entries of 8
+    threadgroup uint8_t* ssigns = (threadgroup uint8_t*)(sgrid + 512);
+    for (short i = 32 * sgitg + tiisg; i < 256; i += 32 * NSG) {
+        const uint64_t g = iq2xxs_grid[i];
+        sgrid[2 * i] = half4(half(g & 255), half((g >> 8) & 255), half((g >> 16) & 255), half((g >> 24) & 255));
+        sgrid[2 * i + 1] = half4(half((g >> 32) & 255), half((g >> 40) & 255), half((g >> 48) & 255), half(g >> 56));
+    }
+    for (short i = 32 * sgitg + tiisg; i < 128; i += 32 * NSG)
+        ssigns[i] = ksigns_iq2xs[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float yl[32];
+    float sumf[nr0] = {0.f};
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        for (short i = 0; i < 8; ++i) {
+            const float4 v = y4[i];
+            yl[4 * i] = v[0];
+            yl[4 * i + 1] = v[1];
+            yl[4 * i + 2] = v[2];
+            yl[4 * i + 3] = v[3];
+        }
+        device const block_iq2_xxs* xr = x + ib32 / 8;
+        device const uint16_t* q2 = xr->qs + 4 * (ib32 % 8);
+        device const half* dh = &xr->d;
+        for (short row = 0; row < nr0; ++row) {
+            const float db = dh[0];
+            device const uint8_t* aux8 = (device const uint8_t*)q2;
+            const uint32_t aux32 = q2[2] | (q2[3] << 16);
+            const float d = db * (0.5f + (aux32 >> 28));
+            float sum = 0;
+            for (short l = 0; l < 4; ++l) {
+                const half4 g0 = sgrid[2 * aux8[l]], g1 = sgrid[2 * aux8[l] + 1];
+                const uint signs = ssigns[(aux32 >> 7 * l) & 127];
+                for (short j = 0; j < 4; ++j) {
+                    const float p = yl[8 * l + j] * float(g0[j]);
+                    sum += (signs >> j) & 1 ? -p : p;
+                }
+                for (short j = 0; j < 4; ++j) {
+                    const float p = yl[8 * l + 4 + j] * float(g1[j]);
+                    sum += (signs >> (4 + j)) & 1 ? -p : p;
+                }
+            }
+            sumf[row] += d * sum;
+            dh += args.nb01 / 2;
+            q2 += args.nb01 / 2;
+        }
+        y4 += 8 * 32;
+    }
+    device float* dst_f32 = (device float*)dst + uint64_t(im) * args.ne0 * args.ne1 + uint64_t(tgpig.y) * args.ne0;
+    for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float s = simd_sum(sumf[row]);
+        if (tiisg == 0)
+            dst_f32[first_row + row] = s * 0.25f;
+    }
+}
+
+#define MAKO_IQ(fmt, nr)                                                                                               \
+    [[host_name("mako_mul_mv_" #fmt "_f32_r" #nr)]] kernel void mako_mul_mv_##fmt##_r##nr(                          \
+        constant ggml_metal_kargs_mul_mv& args, device const char* src0, device const char* src1, device char* dst,   \
+        threadgroup char* shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]],                     \
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]])                  \
+    {                                                                                                                  \
+        mako_##fmt##_impl<nr, constant ggml_metal_kargs_mul_mv&>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);   \
+    }                                                                                                                  \
+    SLOTS("mako_" #fmt "_f32_r" #nr, mako_##fmt##_impl<nr>)
+MAKO_IQ(iq2_xxs, 4)

@@ -150,8 +150,17 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
         kern.smem = ti->smem;
         kern.rows_per_sg_grid = ti->rows_per_sg_grid;
     }
+    // mako's IQ2_XXS kernel: the per-format kernel's results, faster (grid table as half).
+    const bool own_iq = own_kernels_ && tokens == 1 && type == gguf::Type::IQ2_XXS;
+    if (own_iq) {
+        kern.nr0 = 4;
+        name = "mako_mul_mv_iq2_xxs_f32_r4";
+        kern.smem = 256 * 16 + 128;
+    }
 
-    if (indexed)
+    if (indexed && own_iq)
+        name.replace(0, std::string_view("mako_mul_mv_").size(), "mako_mul_mv_slots_mako_");
+    else if (indexed)
         name.replace(0, std::string_view("kernel_mul_mv_").size(), "mako_mul_mv_slots_");
     else if (tokens > 1)
         name = std::format("mako_mul_mv_q6_K_t{}", tokens);
