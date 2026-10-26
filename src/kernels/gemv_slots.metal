@@ -436,3 +436,62 @@ kernel void mako_mul_mv_f32_f32_4_route(constant ggml_metal_kargs_mul_mv& args [
     if (tiitg == 0)
         atomic_store_explicit(counters + t, 0u, memory_order_relaxed);
 }
+
+// Several independent GEMVs of a few tokens in one dispatch, so one ramp-up and tail is paid instead of one per
+// GEMV and the small ones hide under the large. A job table of GPU addresses (the encoder makes the buffers
+// resident); each job runs its format's kernel over its threadgroups, 4 simdgroups a threadgroup: the K-splitting
+// kernels (Q8_0, F32) as always, the row-per-simdgroup ones with twice the rows a threadgroup, each row's sum as
+// before. An indexed job looks each matrix up in slot ids as the slots kernel does.
+struct GemvJob {
+    device const char* w;     // weights: matrix 0 / slot 0
+    device const char* x;     // activations: token 0, matrix 0
+    device char* y;           // outputs: token 0, matrix 0
+    device const int* ids;    // indexed: the slot ids (a row per token); null otherwise
+    device const char* w_tail; // indexed: the slots from `split` on
+    uint64_t nb02;            // bytes between matrices or slots
+    uint64_t nb01;            // bytes between rows
+    uint64_t x_tok, x_mat;    // bytes between tokens' / matrices' x rows (x_mat 0: shared)
+    uint64_t y_tok, y_mat;    // bytes between tokens' / matrices' y rows
+    uint ids_stride;          // elements between tokens' id rows
+    uint split;
+    uint type;                // JobType
+    uint k, n, nr0;
+    uint tg0, tgs_x;          // first threadgroup; threadgroups per matrix
+    uint nb00;                // block bytes
+};
+enum JobType : uint { JOB_Q6_K = 0, JOB_Q8_0 = 1, JOB_F32_4 = 2, JOB_IQ2_XXS = 3, JOB_IQ3_XXS = 4, JOB_IQ2_S = 5 };
+
+kernel void mako_mul_mv_jobs(constant GemvJob* jobs [[buffer(0)]], constant uint& njobs [[buffer(1)]],
+                             threadgroup char* shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]],
+                             ushort tiitg [[thread_index_in_threadgroup]], ushort tiisg [[thread_index_in_simdgroup]],
+                             ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint j = 0;
+    while (j + 1 < njobs && tgpig.x >= jobs[j + 1].tg0)
+        ++j;
+    constant GemvJob& job = jobs[j];
+    const uint local = tgpig.x - job.tg0, mat = local / job.tgs_x, token = tgpig.y;
+    const uint3 tg(local % job.tgs_x, 0, 0);
+    device const char* src0;
+    if (job.ids) {
+        const int slot = job.ids[token * job.ids_stride + mat];
+        src0 = uint(slot) < job.split ? job.w + slot * job.nb02 : job.w_tail + (slot - int(job.split)) * job.nb02;
+    } else {
+        src0 = job.w + mat * job.nb02;
+    }
+    device const char* src1 = job.x + token * job.x_tok + mat * job.x_mat;
+    device char* dst = job.y + token * job.y_tok + mat * job.y_mat;
+    ggml_metal_kargs_mul_mv args = {
+        int(job.k), int(job.n), 1, job.nb00, job.nb01, job.nb02, job.nb02, int(job.k), 1, 1,
+        4, uint64_t(job.k) * 4, uint64_t(job.k) * 4, uint64_t(job.k) * 4, int(job.n), 1, int(job.nr0), 1, 1,
+    };
+    switch (job.type) {
+    case JOB_Q6_K: mmv_fn<kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
+    case JOB_Q8_0: mmv_fn<kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
+    case JOB_F32_4: mmv_fn<kernel_mul_mv_t_t_4_disp<float, float4, float, float4>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
+    case JOB_IQ2_XXS: mako_iq2_xxs_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
+    case JOB_IQ3_XXS: mako_iq3_xxs_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
+    case JOB_IQ2_S: mmv_fn<kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
+    default: break;
+    }
+}

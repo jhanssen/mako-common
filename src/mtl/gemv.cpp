@@ -94,6 +94,29 @@ struct ShortArgs {
     uint32_t k, n, row_bytes, tokens;
 };
 
+// Layout must match GemvJob in gemv_slots.metal (pointers as GPU addresses).
+struct JobRow {
+    uint64_t w, x, y, ids, w_tail;
+    uint64_t nb02, nb01, x_tok, x_mat, y_tok, y_mat;
+    uint32_t ids_stride, split, type, k, n, nr0, tg0, tgs_x, nb00;
+};
+static_assert(sizeof(JobRow) == 128);
+
+// The job kernel's type code, rows per simdgroup and rows per threadgroup (4 simdgroups), or -1.
+int job_type(gguf::Type t, int& nr0, int& rows_per_tg)
+{
+    using gguf::Type;
+    switch (t) {
+    case Type::Q6_K: nr0 = 2, rows_per_tg = 8; return 0;
+    case Type::Q8_0: nr0 = 2, rows_per_tg = 2; return 1;  // the simdgroups split K
+    case Type::F32: nr0 = 2, rows_per_tg = 2; return 2;   // the same
+    case Type::IQ2_XXS: nr0 = 4, rows_per_tg = 16; return 3;
+    case Type::IQ3_XXS: nr0 = 4, rows_per_tg = 16; return 4;
+    case Type::IQ2_S: nr0 = 4, rows_per_tg = 16; return 5;
+    default: return -1;
+    }
+}
+
 } // namespace
 
 Gemv::Gemv(const Context& ctx) : ctx_(ctx), lib_(ctx.load(gemv_metallib())), own_lib_(ctx.load(kernels_metallib())) {}
@@ -291,6 +314,91 @@ bool Gemv::encode_router(MTL::ComputeCommandEncoder* enc, const Args& a, const M
     enc->setThreadgroupMemoryLength(32 * 4 * 2, 0);
     enc->dispatchThreadgroups(MTL::Size((a.n + 1) / 2, a.t, 1), MTL::Size(32, router_nsg_, 1));
     return true;
+}
+
+bool Gemv::job_supported(const Args& a) const
+{
+    int nr0, rows;
+    if (!own_kernels_ || a.t > 8 || job_type(a.type, nr0, rows) < 0)
+        return false;
+    if (a.type == gguf::Type::F32 || a.type == gguf::Type::Q8_0)
+        return a.k % 32 == 0 && a.k >= 512 && a.k % 4 == 0;
+    return a.k >= 1024 && a.k % 256 == 0;
+}
+
+void Gemv::encode_jobs(MTL::ComputeCommandEncoder* enc, std::span<const Job> jobs, MTL::Buffer* table,
+                       uint64_t table_off)
+{
+    if (jobs.empty())
+        return;
+    if (!jobs_pso_) {
+        Ref<MTL::FunctionConstantValues> fc(MTL::FunctionConstantValues::alloc()->init());
+        const int16_t nsg = 4, nxpsg = 16, one = 1;
+        const bool split = false;
+        fc->setConstantValue(&nsg, MTL::DataTypeShort, 600);
+        fc->setConstantValue(&nxpsg, MTL::DataTypeShort, 601);
+        fc->setConstantValue(&one, MTL::DataTypeShort, 602);
+        fc->setConstantValue(&one, MTL::DataTypeShort, 603);
+        fc->setConstantValue(&one, MTL::DataTypeShort, 604);
+        fc->setConstantValue(&split, MTL::DataTypeBool, 605);
+        jobs_pso_ = ctx_.pipeline(lib_.get(), "mako_mul_mv_jobs", fc.get());
+    }
+    auto* rows = reinterpret_cast<JobRow*>(static_cast<char*>(table->contents()) + table_off);
+    const uint32_t T = jobs[0].a.t;
+    uint32_t tg = 0;
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        const Job& j = jobs[i];
+        const Args& a = j.a;
+        int nr0 = 0, rows_per_tg = 0;
+        const int type = job_type(a.type, nr0, rows_per_tg);
+        if (type < 0 || a.t != T || !job_supported(a))
+            throw std::runtime_error("GEMV job not supported");
+        const uint64_t rb = a.type == gguf::Type::F32 ? uint64_t(a.k) * 4 : row_bytes(a.type, a.k);
+        JobRow r{};
+        r.w = j.w->gpuAddress() + j.w_off;
+        r.x = j.x->gpuAddress() + j.x_off;
+        r.y = j.y->gpuAddress() + j.y_off;
+        r.nb01 = rb;
+        r.nb00 = a.type == gguf::Type::F32 ? 4 : gguf::traits(a.type).block_bytes;
+        r.type = uint32_t(type);
+        r.k = a.k;
+        r.n = a.n;
+        r.nr0 = uint32_t(nr0);
+        enc->useResource(j.w, MTL::ResourceUsageRead);
+        enc->useResource(j.x, MTL::ResourceUsageRead);
+        enc->useResource(j.y, MTL::ResourceUsageWrite);
+        if (j.ids) {
+            r.ids = j.ids->gpuAddress() + j.ids_off;
+            r.ids_stride = a.ids_stride ? a.ids_stride / 4 : a.batch;
+            r.nb02 = j.stride;
+            r.w_tail = j.tail.buf ? j.tail.buf->gpuAddress() + j.tail.off : r.w;
+            r.split = j.tail.split;
+            const uint64_t nx = a.x_shared ? 1 : a.batch;
+            r.x_tok = uint64_t(a.k) * 4 * nx;
+            r.x_mat = a.x_shared ? 0 : uint64_t(a.k) * 4;
+            r.y_tok = uint64_t(a.n) * 4 * a.batch;
+            r.y_mat = uint64_t(a.n) * 4;
+            enc->useResource(j.ids, MTL::ResourceUsageRead);
+            if (j.tail.buf)
+                enc->useResource(j.tail.buf, MTL::ResourceUsageRead);
+        } else {
+            r.nb02 = rb * a.n;
+            r.x_tok = uint64_t(a.k) * 4;
+            r.x_mat = a.x_shared ? 0 : uint64_t(a.k) * 4 * T;
+            r.y_tok = uint64_t(j.ldy ? j.ldy : a.n) * 4;
+            r.y_mat = r.y_tok * T;
+        }
+        r.tgs_x = (a.n + rows_per_tg - 1) / rows_per_tg;
+        r.tg0 = tg;
+        tg += r.tgs_x * a.batch;
+        rows[i] = r;
+    }
+    const uint32_t n = uint32_t(jobs.size());
+    enc->setComputePipelineState(jobs_pso_.get());
+    enc->setBuffer(table, table_off, 0);
+    enc->setBytes(&n, sizeof(n), 1);
+    enc->setThreadgroupMemoryLength(256 * 16 + 128, 0);
+    enc->dispatchThreadgroups(MTL::Size(tg, T, 1), MTL::Size(32, 4, 1));
 }
 
 void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,

@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
 #include <tuple>
 
@@ -45,6 +46,30 @@ public:
                        const std::function<void(MTL::ComputeCommandEncoder*)>& bind_route);
     void encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                 const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off);
+
+    // One GEMV of a multi-GEMV dispatch (encode_jobs): as encode() (ids null) or encode_indexed() (ids set) would
+    // run it, the outputs laid out the same way.
+    struct Job {
+        Args a;
+        const MTL::Buffer* w = nullptr;
+        uint64_t w_off = 0;
+        const MTL::Buffer* x = nullptr;
+        uint64_t x_off = 0;
+        const MTL::Buffer* y = nullptr;
+        uint64_t y_off = 0;
+        const MTL::Buffer* ids = nullptr; // indexed: int32 slot ids, a row per token
+        uint64_t ids_off = 0, stride = 0; // indexed: bytes between slots
+        GemvTail tail;
+        uint32_t ldy = 0; // plain jobs: y row stride in elements (0: n)
+    };
+    // Whether encode_jobs runs this GEMV: Q6_K, Q8_0 and F32 rows of >= 512 (no short-row kernel), IQ2_XXS,
+    // IQ3_XXS and IQ2_S, up to 8 tokens.
+    bool job_supported(const Args& a) const;
+    // Independent GEMVs over the same tokens in one dispatch (mako_mul_mv_jobs): one ramp-up and tail instead of
+    // one per GEMV. The job table (kJobBytes a job) is written at table + table_off, which the GPU reads.
+    static constexpr uint64_t kJobBytes = 128;
+    void encode_jobs(MTL::ComputeCommandEncoder* enc, std::span<const Job> jobs, MTL::Buffer* table,
+                     uint64_t table_off);
     // y[i] = W[ids[i]] x_i for i < a.batch (t = 1), with matrix s at w + w_off + s * stride and int32 ids read by
     // the GPU; x_i is x when a.x_shared, else row i of x. With `indirect`, the threadgroup grid is read from it
     // (MTLDispatchThreadgroupsIndirectArguments): x and y as indexed_grid() gives them, z the number of ids to run.
@@ -79,6 +104,7 @@ private:
     bool own_kernels_ = true;
     Ref<MTL::ComputePipelineState> router_pso_; // encode_router: built for the first k seen
     int router_nsg_ = 0;
+    Ref<MTL::ComputePipelineState> jobs_pso_;
     std::map<std::tuple<gguf::Type, bool, uint32_t, bool, uint32_t>, Kernel> kernels_;
 };
 
