@@ -270,6 +270,117 @@ void mako_iq3_xxs_impl(args_t args, device const char* src0, device const char* 
     }
 }
 
+// IQ1_S and IQ1_M rows as the per-format kernels compute them (per 8 weights a grid entry of 2-bit values in nibbles,
+// an odd scale and a shift times the sum of those 8 activations), but each grid entry one 32-bit load and its eight
+// values two dot products (the per-format kernels: byte loads and scalar products; decode is arithmetic-bound here).
+template <int nr0, typename args_t>
+void mako_iq1_m_impl(args_t args, device const char* src0, device const char* src1, device char* dst,
+                     threadgroup char* shmem, uint3 tgpig, ushort tiisg, ushort sgitg)
+{
+    const short NSG = FC_mul_mv_nsg;
+    const int nb32 = args.ne00 / 32;
+    const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+    const uint im = tgpig.z, i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const uint64_t offset0 = first_row * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 + (i13 / FC_mul_mv_r3) * args.nb03;
+    const uint64_t offset1 = tgpig.y * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const block_iq1_m* x = (device const block_iq1_m*)(src0 + offset0);
+    device const float4* y4 = (device const float4*)(src1 + offset1) + 8 * tiisg;
+    constant uint32_t* sgrid = iq1s_grid_gpu;
+
+    float4 yv[8];
+    float sumf[nr0] = {0.f};
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        float4 sumy = 0.f;
+        for (short i = 0; i < 8; ++i) {
+            yv[i] = y4[i];
+            sumy[i / 2] += yv[i][0] + yv[i][1] + yv[i][2] + yv[i][3];
+        }
+        device const block_iq1_m* xr = x + ib32 / 8;
+        const int ib = ib32 % 8;
+        device const uint8_t* qs = xr->qs + 4 * ib;
+        device const uint8_t* qh = xr->qh + 2 * ib;
+        device const uint16_t* sc = (device const uint16_t*)xr->scales;
+        for (short row = 0; row < nr0; ++row) {
+            iq1m_scale_t scale;
+            scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const uint32_t g[4] = {sgrid[qs[0] | ((qh[0] << 8) & 0x700)], sgrid[qs[1] | ((qh[0] << 4) & 0x700)],
+                                   sgrid[qs[2] | ((qh[1] << 8) & 0x700)], sgrid[qs[3] | ((qh[1] << 4) & 0x700)]};
+            // nibbles of entry l: weights 8l..8l+3 low, 8l+4..8l+7 high
+            float2 sum = 0.f;
+            for (short l = 0; l < 4; ++l)
+                sum[l / 2] += dot(yv[2 * l], float4(as_type<uchar4>(g[l] & 0x0f0f0f0fu))) +
+                              dot(yv[2 * l + 1], float4(as_type<uchar4>((g[l] >> 4) & 0x0f0f0f0fu)));
+            const float delta1 = sumy[0] * (qh[0] & 0x08 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) +
+                                 sumy[1] * (qh[0] & 0x80 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+            const float delta2 = sumy[2] * (qh[1] & 0x08 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) +
+                                 sumy[3] * (qh[1] & 0x80 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+            sumf[row] += float(scale.f16) * ((sum[0] + delta1) * float(2 * ((sc[ib / 2] >> (6 * (ib % 2))) & 7) + 1) +
+                                             (sum[1] + delta2) * float(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 7) + 1));
+            sc += args.nb01 / 2;
+            qs += args.nb01;
+            qh += args.nb01;
+        }
+        y4 += 8 * 32;
+    }
+    device float* dst_f32 = (device float*)dst + uint64_t(im) * args.ne0 * args.ne1 + uint64_t(tgpig.y) * args.ne0;
+    for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float s = simd_sum(sumf[row]);
+        if (tiisg == 0)
+            dst_f32[first_row + row] = s;
+    }
+}
+
+template <int nr0, typename args_t>
+void mako_iq1_s_impl(args_t args, device const char* src0, device const char* src1, device char* dst,
+                     threadgroup char* shmem, uint3 tgpig, ushort tiisg, ushort sgitg)
+{
+    const short NSG = FC_mul_mv_nsg;
+    const int nb32 = args.ne00 / 32;
+    const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+    const uint im = tgpig.z, i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const uint64_t offset0 = first_row * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 + (i13 / FC_mul_mv_r3) * args.nb03;
+    const uint64_t offset1 = tgpig.y * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const block_iq1_s* x = (device const block_iq1_s*)(src0 + offset0);
+    device const float4* y4 = (device const float4*)(src1 + offset1) + 8 * tiisg;
+    constant uint32_t* sgrid = iq1s_grid_gpu;
+
+    float4 yv[8];
+    float sumf[nr0] = {0.f};
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        float sumy = 0.f;
+        for (short i = 0; i < 8; ++i) {
+            yv[i] = y4[i];
+            sumy += yv[i][0] + yv[i][1] + yv[i][2] + yv[i][3];
+        }
+        device const block_iq1_s* xr = x + ib32 / 8;
+        const int ib = ib32 % 8;
+        device const uint8_t* qs = xr->qs + 4 * ib;
+        device const uint16_t* qh = xr->qh + ib;
+        device const half* dh = &xr->d;
+        for (short row = 0; row < nr0; ++row) {
+            const uint h = qh[0];
+            const uint32_t g[4] = {sgrid[qs[0] | ((h << 8) & 0x700)], sgrid[qs[1] | ((h << 5) & 0x700)],
+                                   sgrid[qs[2] | ((h << 2) & 0x700)], sgrid[qs[3] | ((h >> 1) & 0x700)]};
+            float sum = 0.f;
+            for (short l = 0; l < 4; ++l)
+                sum += dot(yv[2 * l], float4(as_type<uchar4>(g[l] & 0x0f0f0f0fu))) +
+                       dot(yv[2 * l + 1], float4(as_type<uchar4>((g[l] >> 4) & 0x0f0f0f0fu)));
+            sumf[row] += float(dh[0]) * float(2 * ((h >> 12) & 7) + 1) *
+                         (sum + sumy * (h & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA));
+            dh += args.nb01 / 2;
+            qs += args.nb01;
+            qh += args.nb01 / 2;
+        }
+        y4 += 8 * 32;
+    }
+    device float* dst_f32 = (device float*)dst + uint64_t(im) * args.ne0 * args.ne1 + uint64_t(tgpig.y) * args.ne0;
+    for (short row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float s = simd_sum(sumf[row]);
+        if (tiisg == 0)
+            dst_f32[first_row + row] = s;
+    }
+}
+
 #define MAKO_IQ(fmt, nr)                                                                                               \
     [[host_name("mako_mul_mv_" #fmt "_f32_r" #nr)]] kernel void mako_mul_mv_##fmt##_r##nr(                          \
         constant ggml_metal_kargs_mul_mv& args, device const char* src0, device const char* src1, device char* dst,   \
@@ -281,3 +392,5 @@ void mako_iq3_xxs_impl(args_t args, device const char* src0, device const char* 
     SLOTS("mako_" #fmt "_f32_r" #nr, mako_##fmt##_impl<nr>)
 MAKO_IQ(iq2_xxs, 4)
 MAKO_IQ(iq3_xxs, 4)
+MAKO_IQ(iq1_m, 4)
+MAKO_IQ(iq1_s, 4)

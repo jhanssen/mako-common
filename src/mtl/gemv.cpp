@@ -159,11 +159,18 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
     }
     // mako's IQ2_XXS / IQ3_XXS kernels, faster (grid tables as half): IQ2_XXS gives the per-format kernel's results bit
     // for bit, IQ3_XXS rounds differently (~1e-7 relative).
-    const bool own_iq = own_kernels_ && tokens == 1 && (type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ3_XXS);
+    // mako's IQ1_S / IQ1_M kernels: the same sums, vectorized.
+    const bool own_iq = own_kernels_ && tokens == 1 &&
+                        (type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ3_XXS || type == gguf::Type::IQ1_S ||
+                         type == gguf::Type::IQ1_M);
     if (own_iq) {
         kern.nr0 = 4;
-        name = type == gguf::Type::IQ2_XXS ? "mako_mul_mv_iq2_xxs_f32_r4" : "mako_mul_mv_iq3_xxs_f32_r4";
-        kern.smem = type == gguf::Type::IQ2_XXS ? 256 * 16 + 128 : 256 * 8 + 128;
+        switch (type) {
+        case gguf::Type::IQ2_XXS: name = "mako_mul_mv_iq2_xxs_f32_r4", kern.smem = 256 * 16 + 128; break;
+        case gguf::Type::IQ3_XXS: name = "mako_mul_mv_iq3_xxs_f32_r4", kern.smem = 256 * 8 + 128; break;
+        case gguf::Type::IQ1_S: name = "mako_mul_mv_iq1_s_f32_r4", kern.smem = 0; break;
+        default: name = "mako_mul_mv_iq1_m_f32_r4", kern.smem = 0; break;
+        }
     }
 
     if (indexed && own_iq)

@@ -1,6 +1,6 @@
 // mako's own GEMV kernels against the per-format ones they replace on random blocks: plain (one x), a batch sharing
-// x, and indexed by expert ids. IQ2_XXS bit for bit; IQ3_XXS rounds differently (relative error below 1e-6). Both
-// the same across identical runs.
+// x, and indexed by expert ids. IQ2_XXS bit for bit; IQ3_XXS, IQ1_S and IQ1_M round differently (relative error below
+// 1e-6). All the same across identical runs.
 //   gemv_own_test
 #include "mtl/context.hpp"
 #include "mtl/gemv.hpp"
@@ -28,7 +28,9 @@ int main()
     };
     for (const Case c : {Case{Type::IQ2_XXS, 5120, 2304, true}, Case{Type::IQ2_XXS, 4096, 1000, true},
                          Case{Type::IQ2_XXS, 2048, 4096, true}, Case{Type::IQ3_XXS, 2304, 5120, false},
-                         Case{Type::IQ3_XXS, 2048, 4096, false}}) {
+                         Case{Type::IQ3_XXS, 2048, 4096, false}, Case{Type::IQ1_M, 5120, 2304, false},
+                         Case{Type::IQ1_M, 2304, 5120, false}, Case{Type::IQ1_S, 5120, 2304, false},
+                         Case{Type::IQ1_S, 2304, 5120, false}}) {
         const uint32_t batch = 6, n_expert = 16;
         const uint64_t rb = mako::mtl::Gemv::row_bytes(c.type, c.k), mat = rb * c.n;
         mako::mtl::Ref<MTL::Buffer> w(ctx.device()->newBuffer(mat * n_expert, MTL::ResourceStorageModeShared));
