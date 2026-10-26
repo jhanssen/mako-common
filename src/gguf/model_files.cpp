@@ -1,5 +1,6 @@
 #include "gguf/model_files.hpp"
 
+#include <filesystem>
 #include <format>
 #include <regex>
 
@@ -40,6 +41,10 @@ std::expected<ModelFiles, std::string> ModelFiles::open(const std::string& first
 
 std::expected<void, std::string> ModelFiles::add(const std::string& path)
 {
+    std::error_code ec;
+    for (const auto& have : files_) // already one of the shards
+        if (std::filesystem::equivalent(have.path(), path, ec))
+            return {};
     auto f = File::open(path);
     if (!f)
         return std::unexpected(f.error());
