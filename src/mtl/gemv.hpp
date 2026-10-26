@@ -63,7 +63,7 @@ public:
         uint32_t ldy = 0; // plain jobs: y row stride in elements (0: n)
     };
     // Whether encode_jobs runs this GEMV: Q6_K, Q8_0 and F32 rows of >= 512 (no short-row kernel), IQ2_XXS,
-    // IQ3_XXS and IQ2_S, up to 8 tokens.
+    // IQ3_XXS, IQ2_S and IQ3_S, up to 8 tokens.
     bool job_supported(const Args& a) const;
     // Independent GEMVs over the same tokens in one dispatch (mako_mul_mv_jobs): one ramp-up and tail instead of
     // one per GEMV. The job table (kJobBytes a job) is written at table + table_off, which the GPU reads.
