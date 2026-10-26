@@ -394,3 +394,45 @@ MAKO_IQ(iq2_xxs, 4)
 MAKO_IQ(iq3_xxs, 4)
 MAKO_IQ(iq1_m, 4)
 MAKO_IQ(iq1_s, 4)
+
+#include "moe_route.h"
+
+// The F32 router GEMV (a few tokens, rows of n_expert <= 512) that also routes: the last threadgroup to finish a
+// token's rows (a device-scope fence, then a counter per token, zero between dispatches) selects its experts as
+// moe_route does. Buffers 0-3 as the GEMV, 4-13 as moe_route's 1-10, 14 the counters.
+kernel void mako_mul_mv_f32_f32_4_route(constant ggml_metal_kargs_mul_mv& args [[buffer(0)]],
+                                        device const char* src0 [[buffer(1)]], device const char* src1 [[buffer(2)]],
+                                        device char* dst [[buffer(3)]], device const float* bias [[buffer(4)]],
+                                        device int* sel [[buffer(5)]], device float* w [[buffer(6)]],
+                                        device float* biased [[buffer(7)]], constant RouteArgs& ra [[buffer(8)]],
+                                        device const int* slots [[buffer(9)]], device int* hit_ids [[buffer(10)]],
+                                        device int* miss_rank [[buffer(11)]], device uint* indirect [[buffer(12)]],
+                                        device atomic_uint* counts [[buffer(13)]],
+                                        device atomic_uint* counters [[buffer(14)]],
+                                        threadgroup char* shmem [[threadgroup(0)]],
+                                        uint3 tgpig [[threadgroup_position_in_grid]],
+                                        ushort tiitg [[thread_index_in_threadgroup]],
+                                        ushort tiisg [[thread_index_in_simdgroup]],
+                                        ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2, constant ggml_metal_kargs_mul_mv&>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    threadgroup uint last[1];
+    const uint t = tgpig.y, tgs = (uint(args.ne01) + 1) / 2; // threadgroups per token: 2 rows each
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tiitg == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        last[0] = atomic_fetch_add_explicit(counters + t, 1u, memory_order_relaxed) + 1 == tgs ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!last[0])
+        return;
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (sgitg == 0) {
+        device const float* logits = reinterpret_cast<device const float*>(dst) + uint64_t(t) * uint(args.ne0);
+        moe_route_token(logits, bias, sel + t * 16, w + t * 16, biased + uint64_t(t) * ra.n_expert, ra, slots,
+                        hit_ids + t * 16, miss_rank + t * 16, indirect + t * 9, counts, tiisg);
+    }
+    if (tiitg == 0)
+        atomic_store_explicit(counters + t, 0u, memory_order_relaxed);
+}

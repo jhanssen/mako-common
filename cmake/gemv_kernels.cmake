@@ -21,9 +21,10 @@ endforeach()
 set(GEMV_METALLIB ${CMAKE_BINARY_DIR}/gemv.metallib)
 add_custom_command(
     OUTPUT ${GEMV_METALLIB}
-    COMMAND xcrun -sdk macosx metal -std=metal4.0 -I ${GEMV_KERNELS_DIR}
+    COMMAND xcrun -sdk macosx metal -std=metal4.0 -I ${GEMV_KERNELS_DIR} -I ${CMAKE_SOURCE_DIR}/src/kernels
             -c ${CMAKE_SOURCE_DIR}/src/kernels/gemv_slots.metal -o ${CMAKE_BINARY_DIR}/gemv.air
     COMMAND xcrun -sdk macosx metallib ${CMAKE_BINARY_DIR}/gemv.air -o ${GEMV_METALLIB}
     DEPENDS ${GEMV_KERNELS_DIR}/mul_mv.metal ${CMAKE_SOURCE_DIR}/src/kernels/gemv_slots.metal
+            ${CMAKE_SOURCE_DIR}/src/kernels/moe_route.h
     COMMENT "Compiling reference GEMV kernels")
 add_custom_target(gemv_metallib DEPENDS ${GEMV_METALLIB})

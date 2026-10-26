@@ -3,6 +3,7 @@
 #include "gguf/gguf.hpp"
 #include "mtl/context.hpp"
 
+#include <functional>
 #include <map>
 #include <string>
 #include <tuple>
@@ -36,6 +37,12 @@ public:
     static bool supports(gguf::Type type);
     static uint64_t row_bytes(gguf::Type type, uint32_t k);
 
+    // The F32 router GEMV that also routes each token in its last threadgroup (mako_mul_mv_f32_f32_4_route):
+    // bind_route binds the routing's buffers (4..14) before the dispatch. False (nothing encoded) when the shape is
+    // not the kernel's: F32, k a multiple of 4, one matrix, n <= 512, up to 8 tokens.
+    bool encode_router(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
+                       const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off,
+                       const std::function<void(MTL::ComputeCommandEncoder*)>& bind_route);
     void encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                 const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off);
     // y[i] = W[ids[i]] x_i for i < a.batch (t = 1), with matrix s at w + w_off + s * stride and int32 ids read by
@@ -70,6 +77,8 @@ private:
     Ref<MTL::Library> lib_, own_lib_;
     std::map<std::string, Ref<MTL::ComputePipelineState>> own_psos_;
     bool own_kernels_ = true;
+    Ref<MTL::ComputePipelineState> router_pso_; // encode_router: built for the first k seen
+    int router_nsg_ = 0;
     std::map<std::tuple<gguf::Type, bool, uint32_t, bool, uint32_t>, Kernel> kernels_;
 };
 

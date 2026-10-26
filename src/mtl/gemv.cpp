@@ -240,6 +240,59 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
                               MTL::Size(32, kern.nsg, 1));
 }
 
+bool Gemv::encode_router(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
+                         const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off,
+                         const std::function<void(MTL::ComputeCommandEncoder*)>& bind_route)
+{
+    if (!own_kernels_ || a.type != gguf::Type::F32 || a.k % 4 || a.batch != 1 || a.n > 512 || a.t > 8)
+        return false;
+    if (!router_pso_) {
+        Ref<MTL::FunctionConstantValues> fc(MTL::FunctionConstantValues::alloc()->init());
+        const int16_t nsg = int16_t(std::min<int>(4, (int(a.k) + 127) / 128)), nxpsg = 16, one = 1;
+        const bool split = false;
+        fc->setConstantValue(&nsg, MTL::DataTypeShort, 600);
+        fc->setConstantValue(&nxpsg, MTL::DataTypeShort, 601);
+        fc->setConstantValue(&one, MTL::DataTypeShort, 602);
+        fc->setConstantValue(&one, MTL::DataTypeShort, 603);
+        fc->setConstantValue(&one, MTL::DataTypeShort, 604);
+        fc->setConstantValue(&split, MTL::DataTypeBool, 605);
+        router_pso_ = ctx_.pipeline(lib_.get(), "mako_mul_mv_f32_f32_4_route", fc.get());
+        router_nsg_ = nsg;
+    }
+    if (router_nsg_ != std::min<int>(4, (int(a.k) + 127) / 128))
+        return false; // one k per process is all the engines need
+    const uint64_t rb = uint64_t(a.k) * 4;
+    KArgs ka{};
+    ka.ne00 = int32_t(a.k);
+    ka.ne01 = int32_t(a.n);
+    ka.ne02 = 1;
+    ka.nb00 = 4;
+    ka.nb01 = rb;
+    ka.nb02 = rb * a.n;
+    ka.nb03 = ka.nb02;
+    ka.ne10 = int32_t(a.k);
+    ka.ne11 = int32_t(a.t);
+    ka.ne12 = 1;
+    ka.nb10 = 4;
+    ka.nb11 = rb;
+    ka.nb12 = rb * a.t;
+    ka.nb13 = ka.nb12;
+    ka.ne0 = int32_t(a.n);
+    ka.ne1 = int32_t(a.t);
+    ka.nr0 = 2;
+    ka.r2 = 1;
+    ka.r3 = 1;
+    enc->setComputePipelineState(router_pso_.get());
+    enc->setBytes(&ka, sizeof(ka), 0);
+    enc->setBuffer(w, w_off, 1);
+    enc->setBuffer(x, x_off, 2);
+    enc->setBuffer(y, y_off, 3);
+    bind_route(enc);
+    enc->setThreadgroupMemoryLength(32 * 4 * 2, 0);
+    enc->dispatchThreadgroups(MTL::Size((a.n + 1) / 2, a.t, 1), MTL::Size(32, router_nsg_, 1));
+    return true;
+}
+
 void Gemv::encode_indexed(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                           uint64_t stride, const MTL::Buffer* ids, uint64_t ids_off, const MTL::Buffer* x,
                           uint64_t x_off, const MTL::Buffer* y, uint64_t y_off, const MTL::Buffer* indirect,
