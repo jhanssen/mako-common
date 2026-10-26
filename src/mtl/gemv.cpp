@@ -56,6 +56,9 @@ const TypeInfo* info(gguf::Type t)
     static const TypeInfo iq2_s{"kernel_mul_mv_iq2_s_f32", 2, 4, 0, false};
     static const TypeInfo iq2_xs{"kernel_mul_mv_iq2_xs_f32", 2, 4, 512 * 8 + 128, false};
     static const TypeInfo iq2_xxs{"kernel_mul_mv_iq2_xxs_f32", 2, 4, 256 * 8 + 128, false};
+    static const TypeInfo iq4_nl{"kernel_mul_mv_iq4_nl_f32", 2, 2, 32 * 4, false};
+    static const TypeInfo iq1_s{"kernel_mul_mv_iq1_s_f32", 2, 4, 0, false};
+    static const TypeInfo iq1_m{"kernel_mul_mv_iq1_m_f32", 2, 4, 0, false};
     static const TypeInfo mxfp4{"kernel_mul_mv_mxfp4_f32", 2, 2, 32 * 4, false};
     switch (t) {
     case Type::Q8_0: return &q8_0;
@@ -71,6 +74,9 @@ const TypeInfo* info(gguf::Type t)
     case Type::IQ2_S: return &iq2_s;
     case Type::IQ2_XS: return &iq2_xs;
     case Type::IQ2_XXS: return &iq2_xxs;
+    case Type::IQ4_NL: return &iq4_nl;
+    case Type::IQ1_S: return &iq1_s;
+    case Type::IQ1_M: return &iq1_m;
     case Type::MXFP4: return &mxfp4;
     default: return nullptr;
     }
@@ -79,7 +85,8 @@ const TypeInfo* info(gguf::Type t)
 bool is_iq(gguf::Type t)
 {
     using gguf::Type;
-    return t == Type::IQ3_S || t == Type::IQ3_XXS || t == Type::IQ2_S || t == Type::IQ2_XS || t == Type::IQ2_XXS;
+    return t == Type::IQ3_S || t == Type::IQ3_XXS || t == Type::IQ2_S || t == Type::IQ2_XS || t == Type::IQ2_XXS ||
+           t == Type::IQ1_S || t == Type::IQ1_M;
 }
 
 // Layout must match ShortArgs in gemv.metal.

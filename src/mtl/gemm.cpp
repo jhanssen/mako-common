@@ -27,6 +27,9 @@ const char* kernel_name(gguf::Type type)
     case gguf::Type::IQ3_XXS: return "gemm_iq3_xxs";
     case gguf::Type::IQ3_S: return "gemm_iq3_s";
     case gguf::Type::IQ4_XS: return "gemm_iq4_xs";
+    case gguf::Type::IQ2_XS: return "gemm_iq2_xs";
+    case gguf::Type::IQ1_S: return "gemm_iq1_s";
+    case gguf::Type::IQ1_M: return "gemm_iq1_m";
     case gguf::Type::F16: return "gemm_f16";
     default: return nullptr;
     }
@@ -78,8 +81,9 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
     }
     // Tiles of 64 tokens, or 32 where that pads less (an expert's share of a chunk is often under 32 tokens).
     uint32_t tm = (t + 31) / 32 * 32 < (t + 63) / 64 * 64 ? 32 : 64, tn = 32;
-    const bool iq = type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ2_S || type == gguf::Type::IQ3_XXS ||
-                    type == gguf::Type::IQ3_S;
+    const bool iq = type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ2_XS || type == gguf::Type::IQ2_S ||
+                    type == gguf::Type::IQ3_XXS || type == gguf::Type::IQ3_S || type == gguf::Type::IQ1_S ||
+                    type == gguf::Type::IQ1_M;
     if (iq && t <= 16)
         tm = 16; // the matrix work of a 32-token tile, not the dequantization, dominates at few tokens
     // 128- and 256-token tiles dequantize each weight half / a quarter as often as 64-token ones; used where they pad

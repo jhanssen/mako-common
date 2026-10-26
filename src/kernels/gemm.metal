@@ -1,5 +1,5 @@
-// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ2_XXS, IQ2_S,
-// IQ3_XXS, IQ3_S, IQ4_XS, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
+// Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ1_S, IQ1_M,
+// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
 // them).
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -21,7 +21,7 @@ struct GemmArgs {
     uint ldx; // x row stride in elements
 };
 
-enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9, IQ4_XS = 10 };
+enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9, IQ4_XS = 10, IQ2_XS = 11, IQ1_S = 12, IQ1_M = 13 };
 
 // 8 weights from a grid entry (8 or 4 bytes per entry), signs from bit i of sb, times dl.
 static void grid8(constant uchar* g, uint sb, float dl, threadgroup half* out)
@@ -62,6 +62,52 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
         for (short l = 0; l < 4; ++l)
             grid8(reinterpret_cast<constant uchar*>(iq2xxs_grid + ((idx >> (8 * l)) & 255)),
                   ksigns_iq2xs[(aux >> (7 * l)) & 127], dl, out + 8 * l);
+    } else if (Type == IQ2_XS) {
+        // Per 32: four 16-bit entries (9-bit grid index, 7-bit sign index), a 4-bit scale per 16.
+        device const block_iq2_xs* blk = reinterpret_cast<device const block_iq2_xs*>(row) + k0 / 256;
+        const uint ib = (k0 % 256) / 32;
+        device const ushort* q2 = blk->qs + 4 * ib;
+        const float d = float(blk->d);
+        for (short l = 0; l < 4; ++l) {
+            const float dl = d * (0.5f + float((blk->scales[ib] >> (4 * (l / 2))) & 0xf)) * 0.25f;
+            grid8(reinterpret_cast<constant uchar*>(iq2xs_grid + (q2[l] & 511)), ksigns_iq2xs[q2[l] >> 9], dl,
+                  out + 8 * l);
+        }
+    } else if (Type == IQ1_S || Type == IQ1_M) {
+        // Per 32: four 11-bit indices into a grid of 8 values in 0..2 (nibbles), times an odd 3-bit scale, plus a
+        // shift of -1 +- delta. IQ1_S: d per 256, one scale and shift sign per 32 in qh; IQ1_M: d spread over the
+        // scales' top nibbles, a scale per 16 and a shift sign per 8.
+        const uint ib = (k0 % 256) / 32;
+        constexpr float delta = 0.125f;
+        if (Type == IQ1_S) {
+            device const block_iq1_s* blk = reinterpret_cast<device const block_iq1_s*>(row) + k0 / 256;
+            const uint qh = blk->qh[ib];
+            const float dl = float(blk->d) * float(2 * ((qh >> 12) & 7) + 1);
+            const float ml = dl * ((qh & 0x8000) ? -1 - delta : -1 + delta);
+            for (short l = 0; l < 4; ++l) {
+                constant uchar* g = reinterpret_cast<constant uchar*>(iq1s_grid_gpu + (blk->qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)));
+                for (short i = 0; i < 4; ++i) {
+                    out[8 * l + i] = half(dl * float(g[i] & 0xf) + ml);
+                    out[8 * l + 4 + i] = half(dl * float(g[i] >> 4) + ml);
+                }
+            }
+        } else {
+            device const block_iq1_m* blk = reinterpret_cast<device const block_iq1_m*>(row) + k0 / 256;
+            device const ushort* sc = reinterpret_cast<device const ushort*>(blk->scales);
+            const ushort u = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const float d = float(as_type<half>(u));
+            for (short l = 0; l < 4; ++l) {
+                const uint half16 = l / 2, qh = blk->qh[2 * ib + half16];
+                const float dl = d * float(2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3 * half16)) & 7) + 1);
+                const uint bits = (l & 1) ? (qh >> 4) : qh; // index bits 0-2, shift sign bit 3
+                const float ml = dl * ((bits & 8) ? -1 - delta : -1 + delta);
+                constant uchar* g = reinterpret_cast<constant uchar*>(iq1s_grid_gpu + (blk->qs[4 * ib + l] | ((bits & 7) << 8)));
+                for (short i = 0; i < 4; ++i) {
+                    out[8 * l + i] = half(dl * float(g[i] & 0xf) + ml);
+                    out[8 * l + 4 + i] = half(dl * float(g[i] >> 4) + ml);
+                }
+            }
+        }
     } else if (Type == IQ2_S) {
         // Per 32: four index bytes with two high bits each in qh, four sign bytes, a 4-bit scale per 16.
         device const block_iq2_s* blk = reinterpret_cast<device const block_iq2_s*>(row) + k0 / 256;
@@ -423,6 +469,36 @@ template [[host_name("gemm_q4_k_64x32")]] kernel void gemm<Q4_K, 64, 32>(device 
 template [[host_name("gemm_q4_k_128x32")]] kernel void gemm<Q4_K, 128, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_q4_k_256x32")]] kernel void gemm<Q4_K, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xs_16x32")]] kernel void gemm<IQ2_XS, 16, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xs_32x32")]] kernel void gemm<IQ2_XS, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xs_64x32")]] kernel void gemm<IQ2_XS, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xs_128x32")]] kernel void gemm<IQ2_XS, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq2_xs_256x32")]] kernel void gemm<IQ2_XS, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_s_16x32")]] kernel void gemm<IQ1_S, 16, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_s_32x32")]] kernel void gemm<IQ1_S, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_s_64x32")]] kernel void gemm<IQ1_S, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_s_128x32")]] kernel void gemm<IQ1_S, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_s_256x32")]] kernel void gemm<IQ1_S, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_m_16x32")]] kernel void gemm<IQ1_M, 16, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_m_32x32")]] kernel void gemm<IQ1_M, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_m_64x32")]] kernel void gemm<IQ1_M, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_m_128x32")]] kernel void gemm<IQ1_M, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq1_m_256x32")]] kernel void gemm<IQ1_M, 256, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_iq4_xs_32x32")]] kernel void gemm<IQ4_XS, 32, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);

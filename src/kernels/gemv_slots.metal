@@ -129,6 +129,8 @@ SLOTS("iq2_s_f32", kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>)
 SLOTS("iq3_xxs_f32", kernel_mul_mv_iq3_xxs_f32_disp<ggml_metal_kargs_mul_mv>)
 SLOTS("iq3_s_f32", kernel_mul_mv_iq3_s_f32_disp<ggml_metal_kargs_mul_mv>)
 SLOTS("iq4_xs_f32", kernel_mul_mv_iq4_xs_f32_impl<N_R0_IQ4_XS>)
+SLOTS("iq1_s_f32", kernel_mul_mv_iq1_s_f32_disp<ggml_metal_kargs_mul_mv>)
+SLOTS("iq1_m_f32", kernel_mul_mv_iq1_m_f32_disp<ggml_metal_kargs_mul_mv>)
 
 // IQ2_XXS and IQ3_XXS rows with the per-format kernels' layout and each lane's summation order, but the grid entries
 // converted to half once per threadgroup (eight weights are two loads instead of eight byte loads and conversions) and

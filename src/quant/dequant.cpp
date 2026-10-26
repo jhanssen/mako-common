@@ -35,6 +35,20 @@ void q8_0(const std::byte* src, float* dst, uint64_t k)
     }
 }
 
+// Per 32: half d, 16 bytes of nibbles into a non-linear table (low nibbles weights 0-15, high nibbles 16-31).
+void iq4_nl(const std::byte* src, float* dst, uint64_t k)
+{
+    static constexpr int8_t values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    for (uint64_t b = 0; b < k / 32; ++b, src += 18, dst += 32) {
+        const float d = f16(src);
+        const auto* q = reinterpret_cast<const uint8_t*>(src + 2);
+        for (int j = 0; j < 16; ++j) {
+            dst[j] = d * values[q[j] & 0xF];
+            dst[j + 16] = d * values[q[j] >> 4];
+        }
+    }
+}
+
 void q6_k(const std::byte* src, float* dst, uint64_t k)
 {
     for (uint64_t b = 0; b < k / 256; ++b, src += 210) {
@@ -104,7 +118,7 @@ bool can_dequant(gguf::Type type)
 {
     using gguf::Type;
     return type == Type::F32 || type == Type::F16 || type == Type::BF16 || type == Type::Q8_0 || type == Type::Q6_K ||
-           type == Type::Q4_K || type == Type::Q5_K;
+           type == Type::Q4_K || type == Type::Q5_K || type == Type::IQ4_NL;
 }
 
 void dequant_row(gguf::Type type, const std::byte* src, float* dst, uint64_t k)
@@ -122,6 +136,7 @@ void dequant_row(gguf::Type type, const std::byte* src, float* dst, uint64_t k)
         return;
     case Type::Q8_0: q8_0(src, dst, k); return;
     case Type::Q6_K: q6_k(src, dst, k); return;
+    case Type::IQ4_NL: iq4_nl(src, dst, k); return;
     case Type::Q4_K: qk(src, dst, k, 4); return;
     case Type::Q5_K: qk(src, dst, k, 5); return;
     default: break;
