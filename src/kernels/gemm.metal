@@ -1,5 +1,5 @@
 // Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ2_XXS, IQ2_S,
-// IQ3_XXS, IQ3_S, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
+// IQ3_XXS, IQ3_S, IQ4_XS, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
 // them).
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -21,7 +21,7 @@ struct GemmArgs {
     uint ldx; // x row stride in elements
 };
 
-enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9 };
+enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9, IQ4_XS = 10 };
 
 // 8 weights from a grid entry (8 or 4 bytes per entry), signs from bit i of sb, times dl.
 static void grid8(constant uchar* g, uint sb, float dl, threadgroup half* out)
@@ -105,6 +105,18 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
                 out[8 * l + i] = half(dl * float(g1[i]) * ((sg[l] >> i) & 1 ? -1.0f : 1.0f));
                 out[8 * l + 4 + i] = half(dl * float(g2[i]) * ((sg[l] >> (i + 4)) & 1 ? -1.0f : 1.0f));
             }
+        }
+    } else if (Type == IQ4_XS) {
+        // Per 32: a 6-bit scale (low 4 bits in scales_l, high 2 in scales_h), 16 bytes of nibbles into the
+        // non-linear table: low nibbles are weights 0-15, high nibbles 16-31.
+        device const block_iq4_xs* blk = reinterpret_cast<device const block_iq4_xs*>(row) + k0 / 256;
+        const uint ib = (k0 % 256) / 32;
+        const int ls = int(((blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((blk->scales_h >> (2 * ib)) & 3) << 4));
+        const float dl = float(blk->d) * float(ls - 32);
+        device const uchar* qs = blk->qs + 16 * ib;
+        for (short l = 0; l < 16; ++l) {
+            out[l] = half(dl * float(kvalues_iq4nl[qs[l] & 0xf]));
+            out[l + 16] = half(dl * float(kvalues_iq4nl[qs[l] >> 4]));
         }
     } else if (Type == Q4_K || Type == Q5_K) {
         // Per 256: d, dmin, 6-bit scales and mins of 8 sub-blocks of 32, (Q5_K) 32 bytes of fifth bits, then the
@@ -411,6 +423,14 @@ template [[host_name("gemm_q4_k_64x32")]] kernel void gemm<Q4_K, 64, 32>(device 
 template [[host_name("gemm_q4_k_128x32")]] kernel void gemm<Q4_K, 128, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_q4_k_256x32")]] kernel void gemm<Q4_K, 256, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq4_xs_32x32")]] kernel void gemm<IQ4_XS, 32, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq4_xs_64x32")]] kernel void gemm<IQ4_XS, 64, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq4_xs_128x32")]] kernel void gemm<IQ4_XS, 128, 32>(device const uchar*, device const half*, device float*,
+    constant GemmArgs&, uint2, ushort);
+template [[host_name("gemm_iq4_xs_256x32")]] kernel void gemm<IQ4_XS, 256, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
 template [[host_name("gemm_q5_k_32x32")]] kernel void gemm<Q5_K, 32, 32>(device const uchar*, device const half*, device float*,
     constant GemmArgs&, uint2, ushort);
