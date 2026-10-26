@@ -89,7 +89,7 @@ float fit_scale_min(int n, int nmax, const float* x, const float* w, uint8_t* L,
 
 // Symmetric scale of n values for levels -nmax..nmax-1 (stored as l + nmax), weighted by x^2, searched around the
 // range's scale.
-float fit_scale(int n, int nmax, const float* x, int8_t* L)
+float fit_scale(int n, int nmax, const float* x, int8_t* L, const float* imp)
 {
     float amax = 0, max = 0;
     for (int i = 0; i < n; ++i)
@@ -106,7 +106,7 @@ float fit_scale(int n, int nmax, const float* x, int8_t* L)
         for (int i = 0; i < n; ++i) {
             const int l = std::clamp(nearest(iscale * x[i]), -nmax, nmax - 1);
             out[i] = int8_t(l);
-            const float w = x[i] * x[i];
+            const float w = x[i] * x[i] * (imp ? imp[i] : 1.0f);
             sumlx += w * x[i] * l;
             suml2 += w * l * l;
         }
@@ -157,9 +157,9 @@ void scale_min(int j, const uint8_t* q, int& sc, int& m)
 
 // Q4_K / Q5_K block: d, dmin (f16), 12 bytes of scales, then (Q5_K) 32 bytes of high bits, then the low nibbles.
 // Writes the 16-byte header and fills L with the levels 0..nmax.
-void quantize_k(const float* x, int nmax, std::byte* blk, uint8_t* L)
+void quantize_k(const float* x, int nmax, std::byte* blk, uint8_t* L, const float* imp)
 {
-    float scales[8], mins[8], w[32];
+    float scales[8], mins[8], w[256];
     for (int j = 0; j < 8; ++j) {
         const float* xs = x + 32 * j;
         float sum2 = 0;
@@ -167,8 +167,8 @@ void quantize_k(const float* x, int nmax, std::byte* blk, uint8_t* L)
             sum2 += xs[i] * xs[i];
         const float av = std::sqrt(sum2 / 32);
         for (int i = 0; i < 32; ++i)
-            w[i] = av + std::fabs(xs[i]);
-        scales[j] = fit_scale_min(32, nmax, xs, w, L + 32 * j, &mins[j]);
+            w[32 * j + i] = (av + std::fabs(xs[i])) * (imp ? imp[32 * j + i] : 1.0f);
+        scales[j] = fit_scale_min(32, nmax, xs, w + 32 * j, L + 32 * j, &mins[j]);
     }
     const float max_scale = *std::max_element(scales, scales + 8), max_min = *std::max_element(mins, mins + 8);
     const float inv_scale = max_scale > 0 ? 63.0f / max_scale : 0.0f, inv_min = max_min > 0 ? 63.0f / max_min : 0.0f;
@@ -179,9 +179,41 @@ void quantize_k(const float* x, int nmax, std::byte* blk, uint8_t* L)
     }
     put_f16(blk, max_scale / 63.0f);
     put_f16(blk + 2, max_min / 63.0f);
+    const float d = get_f16(blk), dmin = get_f16(blk + 2);
+    // The 6-bit codes rounded from the fitted scale and min need not be the best pair: try the neighbours, each
+    // with its own rounding of the values, by the weighted error.
+    for (int j = 0; j < 8; ++j) {
+        const float* xs = x + 32 * j;
+        const float* ws = w + 32 * j;
+        auto err = [&](int sc, int m) {
+            const float dd = d * sc, dm = dmin * m;
+            float e = 0;
+            for (int i = 0; i < 32; ++i) {
+                const int l = dd > 0 ? std::clamp(nearest((xs[i] + dm) / dd), 0, nmax) : 0;
+                const float diff = dd * l - dm - xs[i];
+                e += ws[i] * diff * diff;
+            }
+            return e;
+        };
+        int best_s = ls[j], best_m = lm[j];
+        float best = err(best_s, best_m);
+        for (int ds = -2; ds <= 2; ++ds)
+            for (int dmn = -2; dmn <= 2; ++dmn) {
+                const int sc = ls[j] + ds, m = lm[j] + dmn;
+                if (sc < 0 || sc > 63 || m < 0 || m > 63 || (ds == 0 && dmn == 0))
+                    continue;
+                const float e = err(sc, m);
+                if (e < best) {
+                    best = e;
+                    best_s = sc;
+                    best_m = m;
+                }
+            }
+        ls[j] = uint8_t(best_s);
+        lm[j] = uint8_t(best_m);
+    }
     auto* sq = reinterpret_cast<uint8_t*>(blk + 4);
     pack_scales(ls, lm, sq);
-    const float d = get_f16(blk), dmin = get_f16(blk + 2);
     for (int j = 0; j < 8; ++j) {
         int sc, m;
         scale_min(j, sq, sc, m);
@@ -194,11 +226,11 @@ void quantize_k(const float* x, int nmax, std::byte* blk, uint8_t* L)
     }
 }
 
-void q4_k(const float* x, std::byte* dst, uint64_t k)
+void q4_k(const float* x, std::byte* dst, uint64_t k, const float* imp)
 {
     for (uint64_t b = 0; b < k / 256; ++b, x += 256, dst += 144) {
         uint8_t L[256];
-        quantize_k(x, 15, dst, L);
+        quantize_k(x, 15, dst, L, imp ? imp + 256 * b : nullptr);
         auto* q = reinterpret_cast<uint8_t*>(dst + 16);
         for (int j = 0; j < 256; j += 64) {
             for (int l = 0; l < 32; ++l)
@@ -208,11 +240,11 @@ void q4_k(const float* x, std::byte* dst, uint64_t k)
     }
 }
 
-void q5_k(const float* x, std::byte* dst, uint64_t k)
+void q5_k(const float* x, std::byte* dst, uint64_t k, const float* imp)
 {
     for (uint64_t b = 0; b < k / 256; ++b, x += 256, dst += 176) {
         uint8_t L[256];
-        quantize_k(x, 31, dst, L);
+        quantize_k(x, 31, dst, L, imp ? imp + 256 * b : nullptr);
         auto* qh = reinterpret_cast<uint8_t*>(dst + 16);
         auto* ql = qh + 32;
         std::memset(qh, 0, 32);
@@ -238,14 +270,14 @@ void q5_k(const float* x, std::byte* dst, uint64_t k)
 }
 
 // Q6_K block: 128 bytes of low nibbles, 64 of high bit pairs, 16 int8 scales (sub-blocks of 16), d (f16).
-void q6_k(const float* x, std::byte* dst, uint64_t k)
+void q6_k(const float* x, std::byte* dst, uint64_t k, const float* imp)
 {
     for (uint64_t b = 0; b < k / 256; ++b, x += 256, dst += 210) {
         int8_t Ls[256];
         float scales[16];
         float max_scale = 0, max_abs = 0;
         for (int j = 0; j < 16; ++j) {
-            scales[j] = fit_scale(16, 32, x + 16 * j, Ls + 16 * j);
+            scales[j] = fit_scale(16, 32, x + 16 * j, Ls + 16 * j, imp ? imp + 256 * b + 16 * j : nullptr);
             if (std::fabs(scales[j]) > max_abs) {
                 max_abs = std::fabs(scales[j]);
                 max_scale = scales[j];
@@ -262,8 +294,34 @@ void q6_k(const float* x, std::byte* dst, uint64_t k)
         const float iscale = -128.0f / max_scale;
         put_f16(dst + 208, 1.0f / iscale);
         const float d = get_f16(dst + 208);
-        for (int j = 0; j < 16; ++j)
-            sc[j] = int8_t(std::min(127, nearest(iscale * scales[j])));
+        for (int j = 0; j < 16; ++j) {
+            const int s0 = std::min(127, nearest(iscale * scales[j]));
+            // The neighbours of the rounded scale, each with its own rounding, by the error weighted by x^2
+            // (times the importance).
+            const float* xs = x + 16 * j;
+            auto err = [&](int s) {
+                const float dd = d * s;
+                float e = 0;
+                for (int i = 0; i < 16; ++i) {
+                    const int l = dd != 0.0f ? std::clamp(nearest(xs[i] / dd), -32, 31) : 0;
+                    const float diff = dd * l - xs[i];
+                    e += xs[i] * xs[i] * (imp ? imp[256 * b + 16 * j + i] : 1.0f) * diff * diff;
+                }
+                return e;
+            };
+            int best_s = s0;
+            float best = err(s0);
+            for (int ds = -2; ds <= 2; ++ds) {
+                const int s1 = s0 + ds;
+                if (ds == 0 || s1 < -128 || s1 > 127)
+                    continue;
+                if (const float e = err(s1); e < best) {
+                    best = e;
+                    best_s = s1;
+                }
+            }
+            sc[j] = int8_t(best_s);
+        }
         for (int j = 0; j < 16; ++j) {
             const float dd = d * sc[j];
             for (int i = 0; i < 16; ++i)
@@ -291,14 +349,14 @@ bool can_quantize(gguf::Type type)
     return type == gguf::Type::Q4_K || type == gguf::Type::Q5_K || type == gguf::Type::Q6_K;
 }
 
-void quantize_row(gguf::Type type, const float* src, std::byte* dst, uint64_t k)
+void quantize_row(gguf::Type type, const float* src, std::byte* dst, uint64_t k, const float* importance)
 {
     if (k % 256)
         throw std::runtime_error("quantize_row: k must be a multiple of 256");
     switch (type) {
-    case gguf::Type::Q4_K: q4_k(src, dst, k); return;
-    case gguf::Type::Q5_K: q5_k(src, dst, k); return;
-    case gguf::Type::Q6_K: q6_k(src, dst, k); return;
+    case gguf::Type::Q4_K: q4_k(src, dst, k, importance); return;
+    case gguf::Type::Q5_K: q5_k(src, dst, k, importance); return;
+    case gguf::Type::Q6_K: q6_k(src, dst, k, importance); return;
     default: break;
     }
     throw std::runtime_error("no quantization to " + std::string(gguf::traits(type).name));

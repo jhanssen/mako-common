@@ -109,6 +109,31 @@ int main()
         check(mrel < 1e-3, std::format("{}: GPU GEMM ({} tokens) vs CPU product with half weights, relative error {:.2e}",
                                        mako::gguf::traits(c.type).name, T, mrel));
     }
+    // With an importance per column, the error weighted by it is lower than without.
+    {
+        std::vector<float> imp(k);
+        for (auto& v : imp)
+            v = std::exp(2.0f * nd(rng));
+        for (const auto t : {Type::Q4_K, Type::Q6_K}) {
+            const uint64_t rb = mako::mtl::Gemv::row_bytes(t, k);
+            std::vector<std::byte> q(rb);
+            std::vector<float> back(k);
+            double plain = 0, weighted = 0;
+            for (uint32_t r = 0; r < n; ++r) {
+                const float* row = w.data() + uint64_t(r) * k;
+                for (const bool use : {false, true}) {
+                    mako::quant::quantize_row(t, row, q.data(), k, use ? imp.data() : nullptr);
+                    mako::quant::dequant_row(t, q.data(), back.data(), k);
+                    double e = 0;
+                    for (uint32_t i = 0; i < k; ++i)
+                        e += imp[i] * double(back[i] - row[i]) * (back[i] - row[i]);
+                    (use ? weighted : plain) += e;
+                }
+            }
+            check(weighted < plain, std::format("{}: importance-weighted error {:.3e} with the importance, {:.3e} without",
+                                                mako::gguf::traits(t).name, weighted, plain));
+        }
+    }
     std::println("{}", failures ? std::format("{} FAILED", failures) : "all passed");
     return failures ? 1 : 0;
 }
