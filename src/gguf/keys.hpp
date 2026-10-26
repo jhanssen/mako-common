@@ -101,6 +101,10 @@ public:
         return out;
     }
 
+    bool has(std::string_view key) const { return f_.find(full(key)) != nullptr; }
+    // `key`, or `other` when only that one is present (two names for the same value).
+    std::string_view either(std::string_view key, std::string_view other) const { return has(key) || !has(other) ? key : other; }
+
 private:
     std::string full(std::string_view key) const { return prefix_ + std::string(key); }
     void note(std::string_view key) { missing += " " + std::string(key); }
