@@ -539,9 +539,11 @@ kernel void mako_mul_mv_f32_f32_4_route(constant ggml_metal_kargs_mul_mv& args [
             logits[r0 + row] = tot;
     }
 
-    // Thread 0 wrote this threadgroup's logits: its fence releases them with the counter, and the last threadgroup's
-    // thread 0 acquires them before the barrier passes them on to the simdgroup that routes.
+    // The barrier orders the logits' writes before thread 0's fence (which thread wrote them depends on the mapping
+    // of thread indices to simdgroup lanes, which the spec leaves open), which releases them with the counter; the
+    // last threadgroup's thread 0 acquires the others' before the second barrier passes them on.
     threadgroup uint last[1];
+    threadgroup_barrier(mem_flags::mem_device);
     if (tiitg == 0) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         last[0] = atomic_fetch_add_explicit(counters + t, 1u, memory_order_relaxed) + 1 == tgs ? 1u : 0u;
