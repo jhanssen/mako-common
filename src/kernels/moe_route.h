@@ -31,6 +31,7 @@ static void moe_route_token(Logits logits, device const float* bias, device int*
                             device int* hit_ids, device int* miss_rank, device uint* indirect,
                             device atomic_uint* counts, uint lane)
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     constexpr uint K = 16;
     float v[K];
     for (uint k = 0; k < K; ++k) {
@@ -41,6 +42,10 @@ static void moe_route_token(Logits logits, device const float* bias, device int*
             biased[e] = v[k];
             if (a.miss_penalty > 0.0f && slots[e] < 0)
                 v[k] -= a.miss_penalty;
+            // A NaN (from a NaN logit) ranks below every number: a round always finds an expert left (n_used <=
+            // n_expert), and the NaN goes on in the weights.
+            if (isnan(v[k]))
+                v[k] = -FLT_MAX;
         }
     }
     uint mine = 0xffffffffu; // the expert chosen in round `lane`
@@ -54,7 +59,7 @@ static void moe_route_token(Logits logits, device const float* bias, device int*
             }
         const float m = simd_max(bv);
         const uint e = simd_min(bv == m && bv > -INFINITY ? lane + 32 * bk : 0xffffffffu);
-        if (e % 32 == lane)
+        if (e < a.n_expert && e % 32 == lane)
             v[e / 32] = -INFINITY;
         if (lane == r)
             mine = e;

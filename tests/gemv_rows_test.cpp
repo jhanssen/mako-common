@@ -234,6 +234,19 @@ int main()
             std::println("{} router  {:4}x{:4} T={}  logits / experts / weights differing: {}", d ? "FAIL" : "ok  ", k,
                          n_expert, T, d);
             failures += d != 0;
+
+            // A NaN in a token's input makes every logit NaN: the routing still selects n_used distinct experts (all
+            // tied: the lowest indices) and the weights carry the NaN.
+            static_cast<float*>(x->contents())[17] = std::nanf("");
+            const Out nan = route(1, 0);
+            const auto* sel = static_cast<const int*>(nan.sel->contents());
+            const auto* wt = static_cast<const float*>(nan.wt->contents());
+            uint32_t bad = 0;
+            for (uint32_t j = 0; j < ra.n_used; ++j)
+                bad += sel[j] != int(j) || !std::isnan(wt[j]);
+            std::println("{} router  {:4}x{:4} NaN input  selections or weights not as expected: {}", bad ? "FAIL" : "ok  ",
+                         k, n_expert, bad);
+            failures += bad != 0;
         }
     }
     std::println("{}", failures ? std::format("{} FAILED", failures) : "all passed");
