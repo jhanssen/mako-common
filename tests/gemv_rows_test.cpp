@@ -4,11 +4,13 @@
 #include "mtl/context.hpp"
 #include "mtl/gemv.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <format>
 #include <print>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -153,6 +155,79 @@ int main()
                     std::println("ok   {}", line);
                 }
             }
+        }
+    }
+    // The router GEMV that routes in its last threadgroup: logits, selected experts and weights per token.
+    {
+        struct RouteArgs { // layout of moe_route.h's
+            uint32_t n_expert, n_used, norm;
+            float scale;
+            uint32_t lookup, score;
+            float miss_penalty;
+        };
+        constexpr uint32_t k = 4096;
+        for (const uint32_t n_expert : {288u, 384u}) {
+            auto w = fx.buffer(uint64_t(k) * n_expert * 4), bias = fx.buffer(n_expert * 4);
+            for (uint64_t i = 0; i < uint64_t(k) * n_expert; ++i)
+                static_cast<float*>(w->contents())[i] = nd(rng) * 0.02f;
+            for (uint32_t e = 0; e < n_expert; ++e)
+                static_cast<float*>(bias->contents())[e] = nd(rng) * 0.01f;
+            const RouteArgs ra{n_expert, 8, 1, 2.5f, 0, n_expert == 384 ? 1u : 0u, 0.0f};
+            auto slots = fx.buffer(n_expert * 4), small = fx.buffer(64 * 4), counts = fx.buffer(n_expert * 4),
+                 counters = fx.buffer(8 * 4);
+            std::memset(counters->contents(), 0, 8 * 4);
+            constexpr uint32_t T = 8;
+            auto x = fx.buffer(uint64_t(k) * T * 4);
+            for (uint64_t i = 0; i < uint64_t(k) * T; ++i)
+                static_cast<float*>(x->contents())[i] = nd(rng);
+            struct Out {
+                Ref<MTL::Buffer> logits, sel, wt, biased;
+            };
+            auto route = [&](uint32_t t, uint64_t x_off) {
+                Out o{fx.buffer(uint64_t(n_expert) * t * 4), fx.buffer(16 * t * 4), fx.buffer(16 * t * 4),
+                      fx.buffer(uint64_t(n_expert) * t * 4)};
+                std::memset(o.sel->contents(), 0, 16 * t * 4);
+                std::memset(o.wt->contents(), 0, 16 * t * 4);
+                bool done = false;
+                fx.run([&](MTL::ComputeCommandEncoder* enc) {
+                    done = gemv.encode_router(enc, Gemv::Args{Type::F32, k, n_expert, t, 1, false}, w.get(), 0, x.get(),
+                                              x_off, o.logits.get(), 0, [&](MTL::ComputeCommandEncoder* e) {
+                        e->setBuffer(bias.get(), 0, 4);
+                        e->setBuffer(o.sel.get(), 0, 5);
+                        e->setBuffer(o.wt.get(), 0, 6);
+                        e->setBuffer(o.biased.get(), 0, 7);
+                        e->setBytes(&ra, sizeof(ra), 8);
+                        e->setBuffer(slots.get(), 0, 9);
+                        e->setBuffer(small.get(), 0, 10);
+                        e->setBuffer(small.get(), 0, 11);
+                        e->setBuffer(small.get(), 0, 12);
+                        e->setBuffer(counts.get(), 0, 13);
+                        e->setBuffer(counters.get(), 0, 14);
+                    });
+                });
+                if (!done)
+                    throw std::runtime_error("encode_router declined the shape");
+                return o;
+            };
+            const Out all = route(T, 0);
+            uint64_t d = 0;
+            const auto differ = [](MTL::Buffer* a, uint64_t a_off, MTL::Buffer* b, uint64_t n) {
+                return uint64_t(std::memcmp(static_cast<const char*>(a->contents()) + a_off, b->contents(), n) != 0);
+            };
+            for (uint32_t t = 0; t < T; ++t) {
+                // The routing ran: normalized weights sum to the scale.
+                float sum = 0.0f;
+                for (uint32_t j = 0; j < ra.n_used; ++j)
+                    sum += static_cast<const float*>(all.wt->contents())[t * 16 + j];
+                d += std::abs(sum - ra.scale) > 1e-4f;
+                const Out one = route(1, uint64_t(t) * k * 4);
+                d += differ(all.logits.get(), uint64_t(t) * n_expert * 4, one.logits.get(), uint64_t(n_expert) * 4);
+                d += differ(all.sel.get(), uint64_t(t) * 64, one.sel.get(), 32);
+                d += differ(all.wt.get(), uint64_t(t) * 64, one.wt.get(), 32);
+            }
+            std::println("{} router  {:4}x{:4} T={}  logits / experts / weights differing: {}", d ? "FAIL" : "ok  ", k,
+                         n_expert, T, d);
+            failures += d != 0;
         }
     }
     std::println("{}", failures ? std::format("{} FAILED", failures) : "all passed");
