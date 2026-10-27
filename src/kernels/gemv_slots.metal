@@ -469,9 +469,13 @@ MAKO_IQ(iq1_s, 4)
 // The F32 router GEMV (a few tokens, rows of n_expert <= 512) that also routes: the last threadgroup to finish a
 // token's rows (a device-scope fence, then a counter per token, zero between dispatches) selects its experts as
 // moe_route does. Buffers 0-3 as the GEMV, 4-13 as moe_route's 1-10, 14 the counters.
+// Device memory is coherent only within a threadgroup unless declared coherent(device) (MSL 4.8), so the logits the
+// last threadgroup reads are written here through such a pointer: kernel_mul_mv_t_t_4_impl with NR0 2 and its
+// helper_mv_reduce_and_write, written out (same sums, same results) for a coherent dst.
 kernel void mako_mul_mv_f32_f32_4_route(constant ggml_metal_kargs_mul_mv& args [[buffer(0)]],
                                         device const char* src0 [[buffer(1)]], device const char* src1 [[buffer(2)]],
-                                        device char* dst [[buffer(3)]], device const float* bias [[buffer(4)]],
+                                        coherent(device) device char* dst [[buffer(3)]],
+                                        device const float* bias [[buffer(4)]],
                                         device int* sel [[buffer(5)]], device float* w [[buffer(6)]],
                                         device float* biased [[buffer(7)]], constant RouteArgs& ra [[buffer(8)]],
                                         device const int* slots [[buffer(9)]], device int* hit_ids [[buffer(10)]],
@@ -484,24 +488,72 @@ kernel void mako_mul_mv_f32_f32_4_route(constant ggml_metal_kargs_mul_mv& args [
                                         ushort tiisg [[thread_index_in_simdgroup]],
                                         ushort sgitg [[simdgroup_index_in_threadgroup]])
 {
-    kernel_mul_mv_t_t_4_impl<float, float4, float, float4, 2, constant ggml_metal_kargs_mul_mv&>(
-        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
-    threadgroup uint last[1];
+    constexpr short NR0 = 2, NW = N_SIMDWIDTH, NB = 32, NF = 16, NF4 = NF / 4;
+    const short NSG = FC_mul_mv_nsg;
+    const int nb = args.ne00 / NB, r0 = tgpig.x * NR0;
     const uint t = tgpig.y, tgs = (uint(args.ne01) + 1) / 2; // threadgroups per token: 2 rows each
-    threadgroup_barrier(mem_flags::mem_device);
+    device const float* y = reinterpret_cast<device const float*>(src1 + t * args.nb11);
+    device const float4* y4 = reinterpret_cast<device const float4*>(y);
+    device const float* ax[NR0];
+    device const float4* ax4[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        ax[row] = reinterpret_cast<device const float*>(src0 + (r0 + row) * args.nb01);
+        ax4[row] = reinterpret_cast<device const float4*>(ax[row]);
+    }
+    float sumf[NR0] = {0.f};
+    const short ix = tiisg / (NW / NF), il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+    float4 yl4[NF4];
+    device const float4* yb4 = y4 + (ib0 * NB + il * NF) / 4;
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        for (short i = 0; i < NF4; ++i)
+            yl4[i] = yb4[i];
+        for (short row = 0; row < NR0; row++) {
+            device const float4* xb4 = ax4[row] + (ib * NB + il * NF) / 4;
+            float sumq = 0.f;
+            for (short i = 0; i < NF4; ++i)
+                sumq += dot(xb4[i], yl4[i]);
+            sumf[row] += sumq;
+        }
+        yb4 += NSG * NF * NW / 4;
+    }
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.ne00; i += NW * NSG)
+        for (short row = 0; row < NR0; row++)
+            sumf[row] += ax[row][i] * y[i];
+    coherent(device) device float* logits = reinterpret_cast<coherent(device) device float*>(dst) + uint64_t(t) * uint(args.ne0);
+    threadgroup float* red[NR0];
+    for (short row = 0; row < NR0; ++row) {
+        red[row] = reinterpret_cast<threadgroup float*>(shmem) + NW * row;
+        if (sgitg == 0)
+            red[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; ++row)
+        if (tiisg == 0)
+            red[row][sgitg] = sumf[row];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+        const float tot = simd_sum(red[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0)
+            logits[r0 + row] = tot;
+    }
+
+    // Thread 0 wrote this threadgroup's logits: its fence releases them with the counter, and the last threadgroup's
+    // thread 0 acquires them before the barrier passes them on to the simdgroup that routes.
+    threadgroup uint last[1];
     if (tiitg == 0) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         last[0] = atomic_fetch_add_explicit(counters + t, 1u, memory_order_relaxed) + 1 == tgs ? 1u : 0u;
+        if (last[0])
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (!last[0])
         return;
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (sgitg == 0) {
-        device const float* logits = reinterpret_cast<device const float*>(dst) + uint64_t(t) * uint(args.ne0);
+    if (sgitg == 0)
         moe_route_token(logits, bias, sel + t * 16, w + t * 16, biased + uint64_t(t) * ra.n_expert, ra, slots,
                         hit_ids + t * 16, miss_rank + t * 16, indirect + t * 9, counts, tiisg);
-    }
     if (tiitg == 0)
         atomic_store_explicit(counters + t, 0u, memory_order_relaxed);
 }

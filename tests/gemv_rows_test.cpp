@@ -214,6 +214,12 @@ int main()
             const auto differ = [](MTL::Buffer* a, uint64_t a_off, MTL::Buffer* b, uint64_t n) {
                 return uint64_t(std::memcmp(static_cast<const char*>(a->contents()) + a_off, b->contents(), n) != 0);
             };
+            // The logits equal the plain F32 GEMV's (the engine's path when it does not route in the GEMV).
+            auto plain = fx.buffer(uint64_t(n_expert) * T * 4);
+            fx.run([&](MTL::ComputeCommandEncoder* enc) {
+                gemv.encode(enc, Gemv::Args{Type::F32, k, n_expert, T, 1, false}, w.get(), 0, x.get(), 0, plain.get(), 0);
+            });
+            d += differ(all.logits.get(), 0, plain.get(), uint64_t(n_expert) * T * 4);
             for (uint32_t t = 0; t < T; ++t) {
                 // The routing ran: normalized weights sum to the scale.
                 float sum = 0.0f;

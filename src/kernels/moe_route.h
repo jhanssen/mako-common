@@ -24,8 +24,9 @@ static float route_score(float l, uint kind)
 // One simdgroup, lane l keeping experts l, l + 32, ... in registers (n_expert <= 512); each of the n_used rounds
 // takes the largest biased score left (lowest index on ties). The pointers are at the token's rows: logits and
 // biased of n_expert, sel, w, hit_ids and miss_rank of 16 (n_used <= 16 used), indirect of 9 (the last three only
-// with a.lookup).
-static void moe_route_token(device const float* logits, device const float* bias, device int* sel, device float* w,
+// with a.lookup). Logits is a device float pointer, coherent(device) when other threadgroups of the dispatch wrote them.
+template <typename Logits>
+static void moe_route_token(Logits logits, device const float* bias, device int* sel, device float* w,
                             device float* biased, constant RouteArgs& a, device const int* slots,
                             device int* hit_ids, device int* miss_rank, device uint* indirect,
                             device atomic_uint* counts, uint lane)
