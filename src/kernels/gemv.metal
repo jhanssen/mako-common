@@ -4,7 +4,7 @@ using namespace metal;
 
 struct ShortArgs {
     uint k, n, row_bytes;
-    uint tokens; // 1..4: x rows of k, y rows of n
+    uint tokens; // 1..8: x rows of k, y rows of n
 };
 
 // Short rows (k <= 512), which the per-format kernels spread over 32 lanes per row and leave mostly idle: four
@@ -15,7 +15,7 @@ kernel void gemv_short(device const uchar* w [[buffer(0)]], device const float* 
                        device float* y [[buffer(2)]], constant ShortArgs& a [[buffer(3)]],
                        uint tid [[thread_position_in_threadgroup]], uint tg [[threadgroup_position_in_grid]])
 {
-    constexpr uint MT = 4;
+    constexpr uint MT = 8;
     threadgroup float xs[MT][512];
     for (uint t = 0; t < a.tokens; ++t)
         for (uint i = tid; i < a.k; i += 256)

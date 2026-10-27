@@ -134,7 +134,7 @@ bool Gemv::encode_short(MTL::ComputeCommandEncoder* enc, const Args& a, const MT
                         const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off)
 {
     const bool q8 = a.type == gguf::Type::Q8_0;
-    if (!own_kernels_ || (!q8 && a.type != gguf::Type::F32) || a.batch != 1 || a.t > 4 || a.k % 32 || a.k > 512)
+    if (!own_kernels_ || (!q8 && a.type != gguf::Type::F32) || a.batch != 1 || a.t > 8 || a.k % 32 || a.k > 512)
         return false;
     const ShortArgs sa{a.k, a.n, uint32_t(row_bytes(a.type, a.k)), a.t};
     enc->setComputePipelineState(own(q8 ? "gemv_short_q8_0" : "gemv_short_f32"));
