@@ -1,5 +1,5 @@
 # Third-party sources (MIT) from one llama.cpp release: the per-format GEMV kernels and the Jinja engine for the GGUF
-# chat templates, with the JSON library it wraps. The release's source archive is downloaded once and only these
+# chat templates (its JSON input is mako's, src/chat/json). The release's source archive is downloaded once and only these
 # files are taken from it, each checked against its SHA-256 (the archive is generated on demand by the host, so its
 # contents are what is pinned, not its bytes). Each entry: path in the release | SHA-256 | destination under
 # third_party/.
@@ -24,11 +24,8 @@ set(_llama_files
     "common/jinja/value.h|6fae65f5eb4b1c07bf2e4a900799982fd40bba8d9db8333aba564463fca553b5|jinja/jinja"
     "common/jinja/value.cpp|a3272e014ec80951b6b5603750078c399f935c0c75175e43178ae7fee749f40c|jinja/jinja"
     "common/jinja/utils.h|61ae8bc57a7a551bdfb294a23a0ef8b5ba8e3cf4d695389f0f0797e2d7689781|jinja/jinja"
-    "common/json.h|a352f31307f1be2bdb34c027b876f42a1c5d1ea775cc8e4f11d703b16c40d22f|jinja"
-    "common/json.cpp|d8c556445cef8e7c93b0857f6ca7ae7ebd8295f169403ac66641b72f6b0598f2|jinja"
     "common/unicode.h|219b9257ac567a3e6bcf0f552c9a9ddc01d46a15eb4d2829ae5e069e643f0ec5|jinja"
     "common/unicode.cpp|191c00abab788e59e83e29fb877047fcbac1f4d6088c5e9962d38ac2e694686c|jinja"
-    "vendor/nlohmann/json.hpp|08f19bbcc66ff3082f5caf58867b1232987dba98d82e2b29d870722fce42776b|jinja/nlohmann"
     "LICENSE|94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d|jinja")
 
 # Whether every file is in place with its hash (then nothing is downloaded).
