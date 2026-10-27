@@ -184,7 +184,7 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
     // mako's IQ2_XXS / IQ3_XXS kernels, faster (grid tables as half): IQ2_XXS gives the per-format kernel's results bit
     // for bit, IQ3_XXS rounds differently (~1e-7 relative).
     // mako's IQ1_S / IQ1_M kernels: the same sums, vectorized.
-    const bool own_iq = own_kernels_ && tokens == 1 &&
+    const bool own_iq = own_kernels_ && tokens == 0 &&
                         (type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ3_XXS || type == gguf::Type::IQ1_S ||
                          type == gguf::Type::IQ1_M);
     if (own_iq) {
@@ -201,7 +201,7 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
         name.replace(0, std::string_view("mako_mul_mv_").size(), "mako_mul_mv_slots_mako_");
     else if (indexed)
         name.replace(0, std::string_view("kernel_mul_mv_").size(), "mako_mul_mv_slots_");
-    else if (tokens > 1)
+    else if (tokens > 0)
         name = std::format("mako_mul_mv_q6_K_t{}", tokens);
 
     Ref<MTL::FunctionConstantValues> fc(MTL::FunctionConstantValues::alloc()->init());
@@ -226,9 +226,11 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
         throw std::runtime_error(std::format("{} GEMV with k={} needs the split-row variant", gguf::traits(a.type).name, a.k));
     if (a.batch > 32767)
         throw std::runtime_error("GEMV batch too large");
-    // Q6_K for 2 tokens: one threadgroup row for both, each weight block decoded once.
-    const uint32_t tokens = own_kernels_ && a.type == gguf::Type::Q6_K && a.t == 2 ? 2 : 1; // 4: slower (spills)
-    Kernel& kern = kernel(a.type, a.k, a.batch, false, tokens);
+    // Q6_K: mako's kernel, two tokens a threadgroup row (each weight block decoded once for both; 4 spills), so a
+    // token's result does not depend on how many run with it.
+    const bool q6 = own_kernels_ && a.type == gguf::Type::Q6_K;
+    const uint32_t step = q6 ? 2 : a.t;
+    Kernel& kern = kernel(a.type, a.k, a.batch, false, q6 ? std::min<uint32_t>(a.t, 2) : 0);
 
     const uint64_t rb = row_bytes(a.type, a.k);
     KArgs ka{};
@@ -252,16 +254,19 @@ void Gemv::encode(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buf
     ka.r2 = 1;
     ka.r3 = 1;
 
-    enc->setComputePipelineState(kern.pso.get());
+    const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
     enc->setBytes(&ka, sizeof(ka), 0);
     enc->setBuffer(w, w_off, 1);
-    enc->setBuffer(x, x_off, 2);
-    enc->setBuffer(y, y_off, 3);
-    if (kern.smem)
-        enc->setThreadgroupMemoryLength(kern.smem, 0);
-    const int rows_per_tg = kern.rows_per_sg_grid ? kern.nr0 : kern.nr0 * kern.nsg;
-    enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, tokens > 1 ? 1 : a.t, a.batch),
-                              MTL::Size(32, kern.nsg, 1));
+    for (uint32_t t0 = 0; t0 < a.t; t0 += step) {
+        Kernel& kt = q6 ? kernel(a.type, a.k, a.batch, false, std::min(step, a.t - t0)) : kern;
+        enc->setComputePipelineState(kt.pso.get());
+        enc->setBuffer(x, x_off + t0 * ka.nb11, 2);
+        enc->setBuffer(y, y_off + uint64_t(t0) * a.n * 4, 3);
+        if (kt.smem)
+            enc->setThreadgroupMemoryLength(kt.smem, 0);
+        enc->dispatchThreadgroups(MTL::Size((a.n + rows_per_tg - 1) / rows_per_tg, q6 ? 1 : a.t, a.batch),
+                                  MTL::Size(32, kt.nsg, 1));
+    }
 }
 
 bool Gemv::encode_router(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,

@@ -91,8 +91,8 @@ private:
         int nsg = 0, nr0 = 0, smem = 0;
         bool rows_per_sg_grid = false;
     };
-    // tokens > 1: a kernel that runs that many tokens per threadgroup (weights read once), where there is one.
-    Kernel& kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed = false, uint32_t tokens = 1);
+    // tokens > 0: mako's Q6_K kernel for that many tokens per threadgroup (weights read once); 0: the format's own.
+    Kernel& kernel(gguf::Type type, uint32_t k, uint32_t batch, bool indexed = false, uint32_t tokens = 0);
 
     bool encode_short(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
                       const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off);

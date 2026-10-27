@@ -38,6 +38,7 @@ kernel void mako_mul_mv_q6_K_tokens(constant ggml_metal_kargs_mul_mv& args, devi
                                     ushort tiisg [[thread_index_in_simdgroup]],
                                     ushort sgitg [[simdgroup_index_in_threadgroup]])
 {
+#pragma METAL fp contract(off)
     constexpr short nr0 = N_R0_Q6_K;
     const short NSG = FC_mul_mv_nsg;
     constexpr uint8_t kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
@@ -102,6 +103,8 @@ kernel void mako_mul_mv_q6_K_tokens(constant ggml_metal_kargs_mul_mv& args, devi
     }
 }
 
+template [[host_name("mako_mul_mv_q6_K_t1")]] kernel void mako_mul_mv_q6_K_tokens<1>(constant ggml_metal_kargs_mul_mv&,
+    device const char*, device const char*, device char*, uint3, ushort, ushort);
 template [[host_name("mako_mul_mv_q6_K_t2")]] kernel void mako_mul_mv_q6_K_tokens<2>(constant ggml_metal_kargs_mul_mv&,
     device const char*, device const char*, device char*, uint3, ushort, ushort);
 template [[host_name("mako_mul_mv_q6_K_t3")]] kernel void mako_mul_mv_q6_K_tokens<3>(constant ggml_metal_kargs_mul_mv&,
