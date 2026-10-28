@@ -11,6 +11,7 @@ struct RouteArgs {
 
 static float route_score(float l, uint kind)
 {
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
     if (kind == 0)
         return 1.0f / (1.0f + precise::exp(-l));
     return precise::sqrt(l > 20.0f ? l : precise::log(1.0f + precise::exp(l)));
