@@ -62,8 +62,8 @@ public:
         GemvTail tail;
         uint32_t ldy = 0; // plain jobs: y row stride in elements (0: n)
     };
-    // Whether encode_jobs runs this GEMV: Q6_K, Q8_0 and F32 rows of >= 512 (no short-row kernel), IQ2_XXS,
-    // IQ3_XXS, IQ2_S and IQ3_S, up to 8 tokens.
+    // Whether encode_jobs runs this GEMV: Q8_0 and F32 rows of >= 512 (no short-row kernel); Q6_K, Q5_K, IQ3_S,
+    // IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_S and IQ1_M rows of >= 1024; up to 8 tokens.
     bool job_supported(const Args& a) const;
     // Independent GEMVs over the same tokens in one dispatch (mako_mul_mv_jobs): one ramp-up and tail instead of
     // one per GEMV. The job table (kJobBytes a job) is written at table + table_off, which the GPU reads.

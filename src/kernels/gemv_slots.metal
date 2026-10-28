@@ -560,6 +560,72 @@ kernel void mako_mul_mv_f32_f32_4_route(constant ggml_metal_kargs_mul_mv& args [
         atomic_store_explicit(counters + t, 0u, memory_order_relaxed);
 }
 
+// The library's IQ2_XS row loop (non-split) for any number of simdgroups, its grid and signs loaded in a loop over
+// the tables as mako_iq3_s_impl does.
+template <int nr0, typename args_t>
+void mako_iq2_xs_impl(args_t args, device const char* src0, device const char* src1, device char* dst,
+                      threadgroup char* shmem, uint3 tgpig, ushort tiisg, ushort sgitg)
+{
+    const short NSG = FC_mul_mv_nsg;
+    const int nb32 = args.ne00 / 32;
+    const int r1 = tgpig.y;
+    const uint im = tgpig.z, i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const int first_row = (int(tgpig.x) * NSG + sgitg) * nr0;
+    const uint64_t offset0 = first_row * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 + (i13 / FC_mul_mv_r3) * args.nb03;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const block_iq2_xs* x = (device const block_iq2_xs*)(src0 + offset0);
+    device const float* y = (device const float*)(src1 + offset1);
+    float yl[32];
+    float sumf[nr0] = {0.f};
+    threadgroup uint64_t* svalues = (threadgroup uint64_t*)shmem;
+    threadgroup uint8_t* ssigns = (threadgroup uint8_t*)(svalues + 512);
+    for (short i = 32 * sgitg + tiisg; i < 512; i += 32 * NSG)
+        svalues[i] = iq2xs_grid[i];
+    for (short i = 32 * sgitg + tiisg; i < 128; i += 32 * NSG)
+        ssigns[i] = ksigns_iq2xs[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const float* y4 = y + 32 * tiisg;
+    for (int ib32 = tiisg; ib32 < nb32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i)
+            yl[i] = y4[i];
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib = ib32 % (QK_K / 32);
+        device const block_iq2_xs* xr = x + ibl;
+        device const uint16_t* q2 = xr->qs + 4 * ib;
+        device const uint8_t* sc = xr->scales + ib;
+        device const half* dh = &xr->d;
+        for (short row = 0; row < nr0; row++) {
+            const float db = dh[0];
+            const float d1 = db * (0.5f + (sc[0] & 0xf));
+            const float d2 = db * (0.5f + (sc[0] >> 4));
+            float sum1 = 0, sum2 = 0;
+            for (short l = 0; l < 2; ++l) {
+                const threadgroup uint8_t* grid = (const threadgroup uint8_t*)(svalues + (q2[l] & 511));
+                const uint8_t signs = ssigns[(q2[l] >> 9)];
+                for (short j = 0; j < 8; ++j)
+                    sum1 += yl[8 * l + j] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            }
+            for (short l = 2; l < 4; ++l) {
+                const threadgroup uint8_t* grid = (const threadgroup uint8_t*)(svalues + (q2[l] & 511));
+                const uint8_t signs = ssigns[(q2[l] >> 9)];
+                for (short j = 0; j < 8; ++j)
+                    sum2 += yl[8 * l + j] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            }
+            sumf[row] += d1 * sum1 + d2 * sum2;
+            dh += args.nb01 / 2;
+            q2 += args.nb01 / 2;
+            sc += args.nb01;
+        }
+        y4 += 32 * 32;
+    }
+    device float* dst_f32 = (device float*)dst + uint64_t(im) * args.ne0 * args.ne1 + uint64_t(r1) * args.ne0;
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0)
+            dst_f32[first_row + row] = sum_all * 0.25f;
+    }
+}
+
 // Several independent GEMVs of a few tokens in one dispatch, so one ramp-up and tail is paid instead of one per
 // GEMV and the small ones hide under the large. A job table of GPU addresses (the encoder makes the buffers
 // resident); each job runs its format's kernel over its threadgroups, 4 simdgroups a threadgroup: the K-splitting
@@ -582,7 +648,10 @@ struct GemvJob {
     uint tg0, tgs_x;          // first threadgroup; threadgroups per matrix
     uint nb00;                // block bytes
 };
-enum JobType : uint { JOB_Q6_K = 0, JOB_Q8_0 = 1, JOB_F32_4 = 2, JOB_IQ2_XXS = 3, JOB_IQ3_XXS = 4, JOB_IQ2_S = 5, JOB_IQ3_S = 6 };
+enum JobType : uint {
+    JOB_Q6_K = 0, JOB_Q8_0 = 1, JOB_F32_4 = 2, JOB_IQ2_XXS = 3, JOB_IQ3_XXS = 4, JOB_IQ2_S = 5, JOB_IQ3_S = 6,
+    JOB_Q5_K = 7, JOB_IQ2_XS = 8, JOB_IQ1_S = 9, JOB_IQ1_M = 10,
+};
 
 kernel void mako_mul_mv_jobs(constant GemvJob* jobs [[buffer(0)]], constant uint& njobs [[buffer(1)]],
                              threadgroup char* shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]],
@@ -616,6 +685,10 @@ kernel void mako_mul_mv_jobs(constant GemvJob* jobs [[buffer(0)]], constant uint
     case JOB_IQ3_XXS: mako_iq3_xxs_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
     case JOB_IQ2_S: mmv_fn<kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
     case JOB_IQ3_S: mako_iq3_s_impl<N_R0_IQ3_S>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
+    case JOB_Q5_K: mmv_fn<kernel_mul_mv_q5_K_f32_impl<N_R0_Q5_K>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
+    case JOB_IQ2_XS: mako_iq2_xs_impl<N_R0_IQ2_XS>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
+    case JOB_IQ1_S: mako_iq1_s_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
+    case JOB_IQ1_M: mako_iq1_m_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
     default: break;
     }
 }

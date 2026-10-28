@@ -114,6 +114,10 @@ int job_type(gguf::Type t, int& nr0, int& rows_per_tg)
     case Type::IQ3_XXS: nr0 = 4, rows_per_tg = 16; return 4;
     case Type::IQ2_S: nr0 = 4, rows_per_tg = 16; return 5;
     case Type::IQ3_S: nr0 = 4, rows_per_tg = 16; return 6;
+    case Type::Q5_K: nr0 = 1, rows_per_tg = 4; return 7;
+    case Type::IQ2_XS: nr0 = 4, rows_per_tg = 16; return 8;
+    case Type::IQ1_S: nr0 = 4, rows_per_tg = 16; return 9;
+    case Type::IQ1_M: nr0 = 4, rows_per_tg = 16; return 10;
     default: return -1;
     }
 }

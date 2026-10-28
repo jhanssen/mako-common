@@ -57,6 +57,19 @@ uint64_t compare(const Fixture& fx, uint32_t rows, uint64_t row_out, MTL::Buffer
     return diff;
 }
 
+// The largest difference between two outputs relative to the largest magnitude in `ref`.
+double max_rel(MTL::Buffer* got, MTL::Buffer* ref, uint64_t n)
+{
+    const auto* a = static_cast<const float*>(got->contents());
+    const auto* b = static_cast<const float*>(ref->contents());
+    double diff = 0, mag = 1e-30;
+    for (uint64_t i = 0; i < n; ++i) {
+        diff = std::max(diff, double(std::abs(a[i] - b[i])));
+        mag = std::max(mag, double(std::abs(b[i])));
+    }
+    return diff / mag;
+}
+
 } // namespace
 
 int main()
@@ -102,11 +115,12 @@ int main()
                 bool ok = true;
 
                 // Plain.
+                auto plain = fx.buffer(uint64_t(s.n) * T * 4);
                 {
-                    auto y = fx.buffer(uint64_t(s.n) * T * 4);
+                    MTL::Buffer* y = plain.get();
                     Gemv::Args a{type, s.k, s.n, T, 1, false};
-                    fx.run([&](MTL::ComputeCommandEncoder* enc) { gemv.encode(enc, a, w.get(), 0, x.get(), 0, y.get(), 0); });
-                    const uint64_t d = compare(fx, T, s.n, y.get(), [&](MTL::ComputeCommandEncoder* enc, uint32_t r, const MTL::Buffer* y1) {
+                    fx.run([&](MTL::ComputeCommandEncoder* enc) { gemv.encode(enc, a, w.get(), 0, x.get(), 0, y, 0); });
+                    const uint64_t d = compare(fx, T, s.n, y, [&](MTL::ComputeCommandEncoder* enc, uint32_t r, const MTL::Buffer* y1) {
                         Gemv::Args a1{type, s.k, s.n, 1, 1, false};
                         gemv.encode(enc, a1, w.get(), 0, x.get(), uint64_t(r) * s.k * 4, y1, 0);
                     });
@@ -123,8 +137,10 @@ int main()
                         Gemv::Job j1{Gemv::Args{type, s.k, s.n, 1, 1, false}, w.get(), 0, x.get(), uint64_t(r) * s.k * 4, y1, 0, nullptr, 0, 0, {}, 0};
                         gemv.encode_jobs(enc, std::span(&j1, 1), fx.table.get(), 0);
                     });
-                    line += std::format("  jobs {}", d);
-                    ok &= d == 0;
+                    // Against the plain kernel, which may sum in another order.
+                    const double rel = max_rel(y.get(), plain.get(), uint64_t(s.n) * T);
+                    line += std::format("  jobs {} ({:.1e})", d, rel);
+                    ok &= d == 0 && rel < 1e-5;
                 }
                 // Indexed experts: each token its own ids and its own x.
                 // MXFP4 and IQ4_NL have no indexed kernel (no expert files use them).
@@ -147,6 +163,15 @@ int main()
                     });
                     line += std::format("  indexed {}", d);
                     ok &= d == 0;
+                    // An indexed job (the merged decode path) against encode_indexed.
+                    if (gemv.job_supported(a)) {
+                        auto yj = fx.buffer(uint64_t(s.n) * sel * T * 4);
+                        Gemv::Job j{a, w.get(), 0, x.get(), 0, yj.get(), 0, ids.get(), 0, mat, {}, 0};
+                        fx.run([&](MTL::ComputeCommandEncoder* enc) { gemv.encode_jobs(enc, std::span(&j, 1), fx.table.get(), 0); });
+                        const double rel = max_rel(yj.get(), y.get(), uint64_t(s.n) * sel * T);
+                        line += std::format("  indexed jobs {:.1e}", rel);
+                        ok &= rel < 1e-5;
+                    }
                 }
                 if (!ok) {
                     ++failures;
