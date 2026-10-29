@@ -203,13 +203,16 @@ static void dequant32(device const uchar* row, uint k0, threadgroup half* out)
 
 // Threadgroups of 4 simdgroups for TM tokens x TN rows; grid (ceil(n / TN), ceil(t / TM)). The half activations
 // go to matmul2d straight from device memory; the weights are dequantized 256 columns at a time into threadgroup
-// memory (fewer, longer matmul2d steps run much faster than 64-wide ones). k must be a multiple of 32.
+// memory (fewer, longer matmul2d steps run much faster than 64-wide ones), IQ weights in tiles of up to 32 tokens
+// 64 at a time (measured 12-23% faster there; even or slower from 64 tokens). k must be a multiple of 32.
 template <int Type, int TM, int TN>
 kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buffer(1)]], device float* y [[buffer(2)]],
                  constant GemmArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
                  ushort tid [[thread_index_in_threadgroup]])
 {
-    constexpr int KD = 256, NSG = 4;
+    constexpr bool iq = Type == IQ1_S || Type == IQ1_M || Type == IQ2_XXS || Type == IQ2_XS || Type == IQ2_S ||
+                        Type == IQ3_XXS || Type == IQ3_S;
+    constexpr int KD = iq && TM <= 32 ? 64 : 256, NSG = 4;
     threadgroup half ws[TN * KD];
     const uint n0 = tg.x * TN, t0 = tg.y * TM;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device half*>(x), dextents<int32_t, 2>(a.k, a.t),
