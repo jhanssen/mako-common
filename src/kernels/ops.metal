@@ -63,20 +63,27 @@ struct AttnArgs {
 
 // o[q][h * D + d] = sum_j softmax_j(scale * q . k_j) v_j[d] over the keys j query q may see: j <= its position, or
 // both at or past `block`. q half [heads][q_pad][D], k and v half [kv_heads][k_pad][D] (head h reads kv head
-// h / (heads / kv_heads)). The scores of 128 keys at a time go to threadgroup memory for the running softmax (eight
-// threads a row), the output stays in registers (rescaled when a row's maximum grows) and both products run through
-// matmul2d with float accumulation. Grid (q_pad / 32, heads), 8 simdgroups.
-template <int D>
+// h / (heads / kv_heads)). A threadgroup takes B queries; the scores of K keys at a time go to threadgroup memory for
+// the running softmax (256 / B threads a row, in base 2), the output stays in registers and both products run through
+// matmul2d with float accumulation. A row's reference maximum moves only when a score passes it by 8 (the
+// exponentials stay within 256, half's range), so most passes leave the output unscaled. q_pad a multiple of B,
+// k_pad of K. Grid (q_pad / B, heads), 8 simdgroups. Measured at 32 heads, 4096 queries x 4122 keys: 32 x 128 13.5 ->
+// 12.2 ms with the lazy maximum; 64 x 64 14.5, 128 x 32 29 ms (the score store and two barriers a pass, not the key
+// and value reads, set the pace).
+template <int D, int B, int K>
 kernel void flash_attn(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
                        device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
                        constant AttnArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                        ushort tid [[thread_index_in_threadgroup]])
 {
 #pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
-    constexpr int B = 32, K = 128;
+    constexpr int TPR = 256 / B, CPT = K / TPR; // threads a row, columns a thread
     threadgroup float s[B * K];
     threadgroup half p[B * K];
     threadgroup float row_scale[B];
+    threadgroup uint rescale;
+    if (tid == 0)
+        rescale = 0;
     const uint q0 = tg.x * B, h = tg.y, kvh = h / (a.heads / a.kv_heads);
     const uint64_t qhead = uint64_t(h) * a.q_pad * D, khead = uint64_t(kvh) * a.k_pad * D;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + qhead + uint64_t(q0) * D,
@@ -99,12 +106,13 @@ kernel void flash_attn(device const half* q [[buffer(0)]], device const half* k 
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] = 0.0f;
-    // Eight threads a row, 16 columns each; each keeps the row's running maximum and sum.
-    const uint r = tid / 8, c0 = (tid % 8) * 16;
+    // Each thread keeps its row's running maximum and sum.
+    const uint r = tid / TPR, c0 = (tid % TPR) * CPT;
     const uint pos = a.q_pos0 + q0 + r;
     // Keys past the block's last query position, when no query of it reaches the image block, are never seen.
     const uint last = a.q_pos0 + min(q0 + B, a.n_q) - 1;
     const uint n_keys = last >= a.block ? a.n_k : min(a.n_k, last + 1);
+    const float scale = a.scale * 1.4426950408889634f; // to base 2
     float m = -INFINITY, l = 0.0f;
     for (uint j0 = 0; j0 < n_keys; j0 += K) {
         for (uint16_t i = 0; i < sc.get_capacity(); ++i)
@@ -114,39 +122,44 @@ kernel void flash_attn(device const half* q [[buffer(0)]], device const half* k 
         qk.run(tq, kt, sc);
         sc.store(ts);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float x[16], mt = -INFINITY;
-        for (uint c = 0; c < 16; ++c) {
+        float x[CPT], mt = -INFINITY;
+        for (uint c = 0; c < CPT; ++c) {
             const uint j = j0 + c0 + c;
             const bool seen = j < a.n_k && (j <= pos || (pos >= a.block && j >= a.block));
-            x[c] = seen ? s[r * K + c0 + c] * a.scale : -INFINITY;
+            x[c] = seen ? s[r * K + c0 + c] * scale : -INFINITY;
             mt = max(mt, x[c]);
         }
-        mt = max(mt, simd_shuffle_xor(mt, 1));
-        mt = max(mt, simd_shuffle_xor(mt, 2));
-        mt = max(mt, simd_shuffle_xor(mt, 4));
-        const float mn = max(m, mt), f = mn == -INFINITY ? 1.0f : exp(m - mn);
+        for (ushort mm = 1; mm < TPR; mm *= 2)
+            mt = max(mt, simd_shuffle_xor(mt, mm));
+        float f = 1.0f;
+        if (mt > m + 8.0f) {
+            f = m == -INFINITY ? 0.0f : exp2(m - mt);
+            m = mt;
+            rescale = 1;
+        }
         float sum = 0.0f;
-        for (uint c = 0; c < 16; ++c) {
-            const float e = mn == -INFINITY ? 0.0f : exp(x[c] - mn);
+        for (uint c = 0; c < CPT; ++c) {
+            const float e = m == -INFINITY ? 0.0f : exp2(x[c] - m);
             p[r * K + c0 + c] = half(e);
             sum += e;
         }
-        sum += simd_shuffle_xor(sum, 1);
-        sum += simd_shuffle_xor(sum, 2);
-        sum += simd_shuffle_xor(sum, 4);
+        for (ushort mm = 1; mm < TPR; mm *= 2)
+            sum += simd_shuffle_xor(sum, mm);
         l = l * f + sum;
-        m = mn;
-        if (tid % 8 == 0)
+        if (tid % TPR == 0)
             row_scale[r] = f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint16_t i = 0; i < acc.get_capacity(); ++i)
-            if (acc.is_valid_element(i))
-                acc[i] *= row_scale[acc.get_multidimensional_index(i)[1]];
+        if (rescale)
+            for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+                if (acc.is_valid_element(i))
+                    acc[i] *= row_scale[acc.get_multidimensional_index(i)[1]];
         auto vt = tv.slice(0, int(j0));
         pv.run(tp, vt, acc);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0)
+            rescale = 0;
     }
-    if (tid % 8 == 0)
+    if (tid % TPR == 0)
         row_scale[r] = l > 0.0f ? 1.0f / l : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
@@ -158,8 +171,10 @@ kernel void flash_attn(device const half* q [[buffer(0)]], device const half* k 
     acc.store(ot);
 }
 
-template [[host_name("flash_attn_128")]] kernel void flash_attn<128>(device const half*, device const half*,
-    device const half*, device float*, constant AttnArgs&, uint2, ushort);
+#define FLASH_ATTN(d, b, k)                                                                                           \
+    template [[host_name("flash_attn_" #d "_" #b "x" #k)]] kernel void flash_attn<d, b, k>(                           \
+        device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort);
+FLASH_ATTN(128, 32, 128)
 
 // x = gelu(x), the tanh approximation.
 kernel void gelu_tanh(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]])
