@@ -9,7 +9,8 @@
 namespace mako::mtl {
 
 // y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (prefill), x in half: weights dequantized to half and multiplied
-// with matmul2d, float accumulation. F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and F16 weights; k a multiple of 32.
+// with matmul2d, float accumulation. F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and F16 weights; BF16
+// weights with x in bfloat; k a multiple of 32.
 class Gemm {
 public:
     explicit Gemm(const Context& ctx);
@@ -25,6 +26,10 @@ public:
     // xh = half(x) as dense rows of `cols`; x rows are ldx floats apart (0: cols).
     void to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                  uint32_t ldx, const MTL::Buffer* xh, uint64_t xh_off);
+    // The same in bfloat, which BF16 weights take instead (bf16_input()).
+    void to_bf16(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
+                 uint32_t ldx, const MTL::Buffer* xb, uint64_t xb_off);
+    static bool bf16_input(gguf::Type type) { return type == gguf::Type::BF16; }
 
 private:
     MTL::ComputePipelineState* pso(const std::string& name);

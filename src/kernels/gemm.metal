@@ -1,5 +1,5 @@
 // Prefill GEMM: y[t][n] = sum_k W[n][k] * x[t][k] for many tokens, x in half (F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ1_S, IQ1_M,
-// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, F16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
+// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, F16 weights) or in bfloat (BF16 weights); matmul2d accumulates into a float cooperative tensor (the GPU's matrix units where it has
 // them).
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -247,6 +247,57 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
                                                                  array<int32_t, 2>{1, int32_t(a.ldy)});
     acc.store(ty.slice(n0, t0));
 }
+
+// Dense weights of the activations' own type E (half or bfloat), staged as they are: rows of k E values.
+template <typename E, int TM, int TN>
+kernel void gemm_dense(device const E* w [[buffer(0)]], device const E* x [[buffer(1)]], device float* y [[buffer(2)]],
+                       constant GemmArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                       ushort tid [[thread_index_in_threadgroup]])
+{
+    constexpr int KD = 256, NSG = 4;
+    threadgroup E ws[TN * KD];
+    const uint n0 = tg.x * TN, t0 = tg.y * TM;
+    tensor<device E, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device E*>(x), dextents<int32_t, 2>(a.k, a.t),
+                                                             array<int32_t, 2>{1, int32_t(a.ldx)});
+    tensor<threadgroup E, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(KD, TN));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, KD, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto mx = tx.slice(0, int(t0));
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(tw), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    for (uint k = 0; k < a.k; k += KD) {
+        for (uint s = tid; s < TN * (KD / 32); s += NSG * 32) {
+            const uint r = s / (KD / 32), c = (s % (KD / 32)) * 32;
+            threadgroup E* wo = ws + r * KD + c;
+            if (n0 + r < a.n && k + c < a.k) {
+                device const E* p = w + uint64_t(n0 + r) * a.k + k + c;
+                for (short i = 0; i < 32; ++i)
+                    wo[i] = p[i];
+            } else {
+                for (short i = 0; i < 32; ++i)
+                    wo[i] = E(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto xk = tx.slice(int(k), int(t0));
+        op.run(xk, tw, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(y, dextents<int32_t, 2>(a.n, a.t),
+                                                                 array<int32_t, 2>{1, int32_t(a.ldy)});
+    acc.store(ty.slice(n0, t0));
+}
+
+#define GEMM_DENSE(name, type, tm)                                                                                    \
+    template [[host_name("gemm_" name "_" #tm "x32")]] kernel void gemm_dense<type, tm, 32>(                          \
+        device const type*, device const type*, device float*, constant GemmArgs&, uint2, ushort);
+GEMM_DENSE("bf16", bfloat, 32)
+GEMM_DENSE("bf16", bfloat, 64)
+GEMM_DENSE("bf16", bfloat, 128)
+GEMM_DENSE("bf16", bfloat, 256)
 
 // Few-token GEMM for IQ2_XXS, IQ2_S and IQ3_XXS weights: each weight is read and dequantized once per NT tokens, in
 // registers, and multiplied with every token (the tiled GEMM above dequantizes into threadgroup memory and runs a
@@ -534,6 +585,13 @@ kernel void to_half(device const float* x [[buffer(0)]], device half* y [[buffer
 {
     if (gid.x < a.cols)
         y[uint64_t(gid.y) * a.cols + gid.x] = half(x[uint64_t(gid.y) * a.ldx + gid.x]);
+}
+
+kernel void to_bf16(device const float* x [[buffer(0)]], device bfloat* y [[buffer(1)]], constant HalfArgs& a [[buffer(2)]],
+                    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.cols)
+        y[uint64_t(gid.y) * a.cols + gid.x] = bfloat(x[uint64_t(gid.y) * a.ldx + gid.x]);
 }
 
 struct PvArgs {

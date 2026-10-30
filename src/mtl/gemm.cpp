@@ -31,6 +31,7 @@ const char* kernel_name(gguf::Type type)
     case gguf::Type::IQ1_S: return "gemm_iq1_s";
     case gguf::Type::IQ1_M: return "gemm_iq1_m";
     case gguf::Type::F16: return "gemm_f16";
+    case gguf::Type::BF16: return "gemm_bf16";
     default: return nullptr;
     }
 }
@@ -98,6 +99,17 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
     enc->setBuffer(y, y_off, 2);
     enc->setBytes(&a, sizeof(a), 3);
     enc->dispatchThreadgroups(MTL::Size((n + tn - 1) / tn, (t + tm - 1) / tm, 1), MTL::Size(128, 1, 1));
+}
+
+void Gemm::to_bf16(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
+                   uint32_t cols, uint32_t ldx, const MTL::Buffer* xb, uint64_t xb_off)
+{
+    const uint32_t a[2] = {cols, ldx ? ldx : cols};
+    enc->setComputePipelineState(pso("to_bf16"));
+    enc->setBuffer(x, x_off, 0);
+    enc->setBuffer(xb, xb_off, 1);
+    enc->setBytes(a, sizeof(a), 2);
+    enc->dispatchThreads(MTL::Size(cols, rows, 1), MTL::Size(256, 1, 1));
 }
 
 void Gemm::to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
