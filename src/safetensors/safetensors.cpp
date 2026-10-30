@@ -38,7 +38,7 @@ std::optional<gguf::Type> type_of(std::string_view dtype)
 
 File::File(File&& o) noexcept
     : path_(std::move(o.path_)), fd_(std::exchange(o.fd_, -1)), tensors_(std::move(o.tensors_)),
-      by_name_(std::move(o.by_name_))
+      by_name_(std::move(o.by_name_)), metadata_(std::move(o.metadata_))
 {
 }
 
@@ -51,6 +51,7 @@ File& File::operator=(File&& o) noexcept
         fd_ = std::exchange(o.fd_, -1);
         tensors_ = std::move(o.tensors_);
         by_name_ = std::move(o.by_name_);
+        metadata_ = std::move(o.metadata_);
     }
     return *this;
 }
@@ -91,8 +92,13 @@ std::expected<File, std::string> File::open(const std::string& path)
         return std::unexpected(path + ": bad header");
     const uint64_t data = 8 + header;
     for (const auto& [name, t] : j.get_object()) {
-        if (name == "__metadata__")
+        if (name == "__metadata__") {
+            if (t.is_object())
+                for (const auto& [k, v] : t.get_object())
+                    if (v.is_string())
+                        f.metadata_.emplace(k, v.get_string());
             continue;
+        }
         if (!t.is_object() || !t.contains("dtype") || !t.contains("shape") || !t.contains("data_offsets"))
             return std::unexpected(std::format("{}: bad entry {}", path, name));
         const auto type = type_of(t["dtype"].get_string());

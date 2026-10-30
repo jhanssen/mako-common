@@ -27,6 +27,8 @@ public:
     int fd() const { return fd_; }
     const std::vector<gguf::Tensor>& tensors() const { return tensors_; }
     const gguf::Tensor* tensor(std::string_view name) const;
+    // The header's __metadata__ (strings).
+    const std::unordered_map<std::string, std::string>& metadata() const { return metadata_; }
 
 private:
     File() = default;
@@ -35,6 +37,7 @@ private:
     int fd_ = -1;
     std::vector<gguf::Tensor> tensors_;
     std::unordered_map<std::string, size_t> by_name_;
+    std::unordered_map<std::string, std::string> metadata_;
 };
 
 // A model's safetensors: one file, or a directory holding one file or an index (`*.safetensors.index.json`) of
