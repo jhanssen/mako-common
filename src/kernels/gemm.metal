@@ -248,43 +248,30 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
     acc.store(ty.slice(n0, t0));
 }
 
-// Dense weights of the activations' own type E (half or bfloat), staged as they are: rows of k E values.
-template <typename E, int TM, int TN>
+// Dense weights of the activations' own type E (half or bfloat), rows of k E values: matmul2d reads both straight
+// from device memory, KD columns a step (no staging in threadgroup memory: 4096 tokens x 4096 -> 12288 -> 4096 BF16
+// 55 -> 64 TFLOP/s against staged 256-column tiles). k a multiple of KD.
+template <typename E, int TM, int TN, int NSG, int KD>
 kernel void gemm_dense(device const E* w [[buffer(0)]], device const E* x [[buffer(1)]], device float* y [[buffer(2)]],
-                       constant GemmArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
-                       ushort tid [[thread_index_in_threadgroup]])
+                       constant GemmArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]])
 {
-    constexpr int KD = 256, NSG = 4;
-    threadgroup E ws[TN * KD];
     const uint n0 = tg.x * TN, t0 = tg.y * TM;
     tensor<device E, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device E*>(x), dextents<int32_t, 2>(a.k, a.t),
                                                              array<int32_t, 2>{1, int32_t(a.ldx)});
-    tensor<threadgroup E, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(KD, TN));
+    tensor<device E, dextents<int32_t, 2>, tensor_inline> tw(const_cast<device E*>(w), dextents<int32_t, 2>(a.k, a.n));
     constexpr auto desc = matmul2d_descriptor(TM, TN, KD, false, true, false,
                                               matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<NSG>> op;
     auto mx = tx.slice(0, int(t0));
-    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(tw), float>();
+    auto mw = tw.slice(0, int(n0));
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(mw), float>();
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] = 0.0f;
     for (uint k = 0; k < a.k; k += KD) {
-        for (uint s = tid; s < TN * (KD / 32); s += NSG * 32) {
-            const uint r = s / (KD / 32), c = (s % (KD / 32)) * 32;
-            threadgroup E* wo = ws + r * KD + c;
-            if (n0 + r < a.n && k + c < a.k) {
-                device const E* p = w + uint64_t(n0 + r) * a.k + k + c;
-                for (short i = 0; i < 32; ++i)
-                    wo[i] = p[i];
-            } else {
-                for (short i = 0; i < 32; ++i)
-                    wo[i] = E(0);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         auto xk = tx.slice(int(k), int(t0));
-        op.run(xk, tw, acc);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto wk = tw.slice(int(k), int(n0));
+        op.run(xk, wk, acc);
     }
     tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(y, dextents<int32_t, 2>(a.n, a.t),
                                                                  array<int32_t, 2>{1, int32_t(a.ldy)});
@@ -292,12 +279,14 @@ kernel void gemm_dense(device const E* w [[buffer(0)]], device const E* x [[buff
 }
 
 #define GEMM_DENSE(name, type, tm)                                                                                    \
-    template [[host_name("gemm_" name "_" #tm "x32")]] kernel void gemm_dense<type, tm, 32>(                          \
-        device const type*, device const type*, device float*, constant GemmArgs&, uint2, ushort);
+    template [[host_name("gemm_" name "_" #tm "x64")]] kernel void gemm_dense<type, tm, 64, 4, 64>(                   \
+        device const type*, device const type*, device float*, constant GemmArgs&, uint2);
 GEMM_DENSE("bf16", bfloat, 32)
 GEMM_DENSE("bf16", bfloat, 64)
 GEMM_DENSE("bf16", bfloat, 128)
-GEMM_DENSE("bf16", bfloat, 256)
+GEMM_DENSE("f16d", half, 32)
+GEMM_DENSE("f16d", half, 64)
+GEMM_DENSE("f16d", half, 128)
 
 // Few-token GEMM for IQ2_XXS, IQ2_S and IQ3_XXS weights: each weight is read and dequantized once per NT tokens, in
 // registers, and multiplied with every token (the tiled GEMM above dequantizes into threadgroup memory and runs a

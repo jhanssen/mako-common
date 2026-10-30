@@ -153,8 +153,8 @@ void Runtime::proj(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffe
 {
     const uint32_t k = uint32_t(w.dims[0]), n = uint32_t(w.dims[1]);
     if (mtl::Gemm::bf16_input(w.type)) { // BF16 matrices have only the GEMM
-        if (k % 32)
-            throw std::runtime_error(std::format("BF16 {}x{}: k must be a multiple of 32", k, n));
+        if (k % 64)
+            throw std::runtime_error(std::format("BF16 {}x{}: k must be a multiple of 64", k, n));
         MTL::Buffer* xb = scratch("xb", uint64_t(T) * k * 2);
         gemm_->to_bf16(enc, x, x_off, T, k, 0, xb, 0);
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, xb, 0, y, y_off, ldy);

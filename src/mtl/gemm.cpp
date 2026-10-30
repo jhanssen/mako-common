@@ -62,7 +62,7 @@ MTL::ComputePipelineState* Gemm::pso(const std::string& name)
 
 void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                   const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* xh, uint64_t xh_off, const MTL::Buffer* y,
-                  uint64_t y_off, uint32_t ldy, uint32_t ldx)
+                  uint64_t y_off, uint32_t ldy, uint32_t ldx, bool direct)
 {
     const char* name = kernel_name(type);
     if (!name || k % 32)
@@ -78,6 +78,19 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
         enc->setBuffer(y, y_off, 2);
         enc->setBytes(&a, sizeof(a), 3);
         enc->dispatchThreadgroups(MTL::Size((n + 15) / 16, 1, 1), MTL::Size(128, 1, 1));
+        return;
+    }
+    if (type == gguf::Type::BF16 || (direct && type == gguf::Type::F16)) {
+        if (k % 64)
+            throw std::runtime_error(std::format("dense GEMM: k={} is not a multiple of 64", k));
+        const uint32_t bm = t <= 32 ? 32 : t <= 64 ? 64 : 128, bn = 64;
+        enc->setComputePipelineState(
+            pso(std::format("{}_{}x{}", type == gguf::Type::BF16 ? "gemm_bf16" : "gemm_f16d", bm, bn)));
+        enc->setBuffer(w, w_off, 0);
+        enc->setBuffer(xh, xh_off, 1);
+        enc->setBuffer(y, y_off, 2);
+        enc->setBytes(&a, sizeof(a), 3);
+        enc->dispatchThreadgroups(MTL::Size((n + bn - 1) / bn, (t + bm - 1) / bm, 1), MTL::Size(128, 1, 1));
         return;
     }
     // Tiles of 64 tokens, or 32 where that pads less (an expert's share of a chunk is often under 32 tokens).
