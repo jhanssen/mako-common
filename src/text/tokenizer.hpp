@@ -14,12 +14,13 @@
 namespace mako::text {
 
 // Byte-level BPE as described by a GGUF's tokenizer.ggml.* metadata (model "gpt2"; GLM's and DeepSeek-V3's
-// pre-tokenizers).
+// pre-tokenizers), or by a Qwen tokenizer.json (no NFC normalization: text not already in NFC can split differently).
 class Tokenizer {
 public:
     enum class TokenType : int32_t { Normal = 1, Unknown = 2, Control = 3, UserDefined = 4, Unused = 5, Byte = 6 };
 
     static std::expected<Tokenizer, std::string> load(const gguf::File& meta);
+    static std::expected<Tokenizer, std::string> load_json(const std::string& path);
 
     // Control tokens written in the text are recognized only with parse_special; user-defined ones always are.
     std::vector<int32_t> encode(std::string_view text, bool parse_special) const;
@@ -48,6 +49,7 @@ private:
     std::vector<int32_t> specials_;                        // longest text first
     bool ignore_merges_ = false;
     bool deepseek_ = false; // DeepSeek-V3's pre-tokenizer, else GLM's
+    uint32_t max_digits_ = 3; // GLM's pre-tokenizer: digits in runs of up to this many (Qwen's: 1)
     int32_t eos_ = -1, eot_ = -1;
 };
 

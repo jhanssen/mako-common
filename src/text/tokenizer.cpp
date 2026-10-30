@@ -1,9 +1,13 @@
 #include "text/tokenizer.hpp"
 
+#include <glaze/glaze.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <variant>
 
@@ -118,9 +122,9 @@ const ByteMap& byte_map()
 }
 
 // Lengths of the pre-tokenizer's pieces, in code points:
-//   's|'t|'re|'ve|'m|'ll|'d (any case) | [^\r\n\pL\pN]?\pL+ | \pN{1,3} | ' '?[^\s\pL\pN]+[\r\n]*
+//   's|'t|'re|'ve|'m|'ll|'d (any case) | [^\r\n\pL\pN]?\pL+ | \pN{1,max_digits} | ' '?[^\s\pL\pN]+[\r\n]*
 //   | \s*[\r\n]+ | \s+(?!\S) | \s+
-std::vector<size_t> split_lengths(const std::vector<uint32_t>& c)
+std::vector<size_t> split_lengths(const std::vector<uint32_t>& c, uint32_t max_digits)
 {
     std::vector<size_t> out;
     const size_t n = c.size();
@@ -152,7 +156,7 @@ std::vector<size_t> split_lengths(const std::vector<uint32_t>& c)
         }
         if (!len && number(i)) {
             size_t j = i;
-            while (j < i + 3 && number(j))
+            while (j < i + max_digits && number(j))
                 ++j;
             len = j - i;
         }
@@ -354,6 +358,64 @@ std::expected<Tokenizer, std::string> Tokenizer::load(const gguf::File& meta)
     return t;
 }
 
+// model.vocab (text -> id) and model.merges ([left, right] pairs, by rank), added_tokens (special ones are control
+// tokens, the rest user-defined); Qwen's split (GLM's with single digits), merges applied as they are.
+std::expected<Tokenizer, std::string> Tokenizer::load_json(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::unexpected("cannot open " + path);
+    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    glz::generic j;
+    if (glz::read_json(j, text) || !j.is_object() || !j.contains("model") || !j["model"].is_object())
+        return std::unexpected(path + ": not a tokenizer.json");
+    const auto& model = j["model"];
+    if (!model.contains("type") || model["type"].get_string() != "BPE" || !model.contains("vocab") ||
+        !model.contains("merges"))
+        return std::unexpected(path + ": not a BPE tokenizer");
+    Tokenizer t;
+    t.max_digits_ = 1;
+    std::vector<std::pair<int32_t, std::string>> entries;
+    for (const auto& [tok, id] : model["vocab"].get_object())
+        entries.emplace_back(int32_t(id.get_number()), tok);
+    std::vector<std::pair<int32_t, bool>> added;
+    if (j.contains("added_tokens"))
+        for (const auto& a : j["added_tokens"].get_array()) {
+            entries.emplace_back(int32_t(a["id"].get_number()), a["content"].get_string());
+            added.emplace_back(int32_t(a["id"].get_number()), a.contains("special") && a["special"].get_boolean());
+        }
+    int32_t n = 0;
+    for (const auto& [id, tok] : entries)
+        n = std::max(n, id + 1);
+    t.tokens_.assign(size_t(n), {});
+    t.types_.assign(size_t(n), TokenType::Unused);
+    for (const auto& [id, tok] : entries) {
+        if (id < 0)
+            return std::unexpected(path + ": negative token id");
+        t.tokens_[size_t(id)] = tok;
+        t.types_[size_t(id)] = TokenType::Normal;
+        t.ids_.emplace(tok, id);
+    }
+    for (const auto& [id, special] : added)
+        t.types_[size_t(id)] = special ? TokenType::Control : TokenType::UserDefined;
+    const auto& merges = model["merges"].get_array();
+    for (size_t i = 0; i < merges.size(); ++i) {
+        const auto& m = merges[i];
+        const std::string pair = m.is_array() ? m[0].get_string() + " " + m[1].get_string() : m.get_string();
+        t.merge_rank_.emplace(pair, int32_t(i));
+    }
+    for (size_t i = 0; i < t.tokens_.size(); ++i) {
+        const TokenType ty = t.types_[i];
+        if (ty == TokenType::Control || ty == TokenType::UserDefined)
+            t.specials_.push_back(int32_t(i));
+    }
+    std::stable_sort(t.specials_.begin(), t.specials_.end(),
+                     [&](int32_t a, int32_t b) { return t.tokens_[a].size() > t.tokens_[b].size(); });
+    t.eos_ = t.find("<|endoftext|>");
+    t.eot_ = t.find("<|im_end|>");
+    return t;
+}
+
 int32_t Tokenizer::find(std::string_view token_text) const
 {
     auto it = ids_.find(std::string(token_text));
@@ -367,7 +429,7 @@ std::vector<std::string> Tokenizer::split(std::string_view text) const
     decode_utf8(text, cps, offs);
     std::vector<std::string> out;
     size_t at = 0;
-    for (size_t len : deepseek_ ? split_lengths_deepseek3(cps) : split_lengths(cps)) {
+    for (size_t len : deepseek_ ? split_lengths_deepseek3(cps) : split_lengths(cps, max_digits_)) {
         out.emplace_back(text.substr(offs[at], offs[at + len] - offs[at]));
         at += len;
     }
