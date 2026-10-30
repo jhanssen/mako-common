@@ -82,10 +82,10 @@ Runtime::Tensor Runtime::reserve(uint64_t bytes, gguf::Type type, std::vector<ui
 }
 
 Runtime::Tensor Runtime::upload_raw(int fd, uint64_t offset, uint64_t bytes, gguf::Type type,
-                                    std::vector<uint64_t> dims, const std::string& what)
+                                    std::vector<uint64_t> dims, const std::string& what, bool keep_bf16)
 {
-    const bool bf16 = type == gguf::Type::BF16;
-    if (type != gguf::Type::F32 && !bf16 && !mtl::Gemv::supports(type))
+    const bool bf16 = type == gguf::Type::BF16 && !keep_bf16;
+    if (type != gguf::Type::F32 && type != gguf::Type::BF16 && !mtl::Gemv::supports(type))
         throw std::runtime_error(std::format("{}: unsupported type {}", what, gguf::traits(type).name));
     Tensor d = reserve(bf16 ? bytes * 2 : bytes, bf16 ? gguf::Type::F32 : type, std::move(dims));
     char* dst = static_cast<char*>(d.buf->contents()) + d.off;
@@ -152,6 +152,16 @@ void Runtime::proj(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffe
                    uint64_t y_off, uint32_t T, uint32_t ldy)
 {
     const uint32_t k = uint32_t(w.dims[0]), n = uint32_t(w.dims[1]);
+    if (mtl::Gemm::bf16_input(w.type)) { // BF16 matrices have only the GEMM
+        if (k % 32)
+            throw std::runtime_error(std::format("BF16 {}x{}: k must be a multiple of 32", k, n));
+        MTL::Buffer* xb = scratch("xb", uint64_t(T) * k * 2);
+        gemm_->to_bf16(enc, x, x_off, T, k, 0, xb, 0);
+        gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, xb, 0, y, y_off, ldy);
+        if (tel_ == Telemetry::kernels)
+            after(enc, std::format("gemm BF16 {}x{}", k, n));
+        return;
+    }
     // A few tokens (decode, speculative verification) stay on the GEMV, which reads each weight once for them.
     if (T >= gemm_min_tokens_ && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type)) {
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, halves(enc, x, x_off, T, k, 0), 0, y, y_off, ldy);

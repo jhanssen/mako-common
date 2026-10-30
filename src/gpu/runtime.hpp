@@ -69,9 +69,10 @@ protected:
 
     // Room for `bytes` in the resident weight buffers, for the caller to fill.
     Tensor reserve(uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims);
-    // `bytes` at `offset` of a file into the resident weight buffers (BF16 becomes F32).
+    // `bytes` at `offset` of a file into the resident weight buffers (BF16 becomes F32 unless keep_bf16: matrices for
+    // the BF16 GEMM).
     Tensor upload_raw(int fd, uint64_t offset, uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims,
-                      const std::string& what);
+                      const std::string& what, bool keep_bf16 = false);
 
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
     MTL::ComputePipelineState* pso(const std::string& fn);
