@@ -101,9 +101,10 @@ std::expected<File, std::string> File::open(const std::string& path)
         }
         if (!t.is_object() || !t.contains("dtype") || !t.contains("shape") || !t.contains("data_offsets"))
             return std::unexpected(std::format("{}: bad entry {}", path, name));
+        // Entries of other types (e.g. a batch norm's I64 counter) are left out: looking one up finds nothing.
         const auto type = type_of(t["dtype"].get_string());
         if (!type)
-            return std::unexpected(std::format("{}: {} has unsupported dtype {}", path, name, t["dtype"].get_string()));
+            continue;
         gguf::Tensor g;
         g.name = name;
         g.type = *type;

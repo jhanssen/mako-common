@@ -205,6 +205,7 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
         device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, \
         ushort);
 FLASH_ATTN_SG(128, 16, 32, 4)
+FLASH_ATTN_SG(256, 16, 32, 4)
 
 struct HeadsNormArgs {
     uint ld, col0, dim, n_pad, row0, rope; // as HeadsArgs
