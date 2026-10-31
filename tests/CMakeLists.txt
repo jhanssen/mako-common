@@ -2,14 +2,14 @@
 mako_add_kernels(common_test_kernels)
 
 add_executable(quant_test quant_test.cpp)
-target_link_libraries(quant_test PRIVATE mako_mtl mako_gguf common_test_kernels)
+target_link_libraries(quant_test PRIVATE mako_mtl mako_gguf)
 add_test(NAME quant COMMAND quant_test)
 
 add_executable(gemv_own_test gemv_own_test.cpp)
-target_link_libraries(gemv_own_test PRIVATE mako_mtl common_test_kernels)
+target_link_libraries(gemv_own_test PRIVATE mako_mtl)
 add_test(NAME gemv_own COMMAND gemv_own_test)
 add_executable(gemv_rows_test gemv_rows_test.cpp)
-target_link_libraries(gemv_rows_test PRIVATE mako_mtl common_test_kernels)
+target_link_libraries(gemv_rows_test PRIVATE mako_mtl)
 add_test(NAME gemv_rows COMMAND gemv_rows_test)
 set_tests_properties(quant gemv_own gemv_rows PROPERTIES LABELS kernels)
 

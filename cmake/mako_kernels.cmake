@@ -1,6 +1,6 @@
 # mako_add_kernels(<target> [SOURCES <file.metal>...] [DEPENDS <file>...]): one metallib of the common kernels and
-# these, compiled with warnings as errors, and an object library <target> defining mako::mtl::kernels_metallib() with it
-# embedded. A program links exactly one such library.
+# these, compiled with warnings as errors, and a library <target> defining mako::mtl::kernels_metallib() with it
+# embedded, linked to mako_mtl (whatever links mako_mtl has it). A project makes exactly one.
 set(MAKO_COMMON_METAL_SOURCES ${MAKO_COMMON_DIR}/src/kernels/gemm.metal ${MAKO_COMMON_DIR}/src/kernels/gemv.metal
     ${MAKO_COMMON_DIR}/src/kernels/ops.metal)
 
@@ -32,8 +32,9 @@ function(mako_add_kernels target)
         "std::span<const std::byte> kernels_metallib() { return std::as_bytes(std::span(kKernels)); }\n\n"
         "} // namespace mako::mtl\n")
     configure_file(${src}.in ${src} COPYONLY)
-    add_library(${target} OBJECT ${src})
-    target_link_libraries(${target} PUBLIC mako_mtl)
+    add_library(${target} STATIC ${src})
+    target_include_directories(${target} PRIVATE ${MAKO_COMMON_DIR}/src)
+    target_link_libraries(mako_mtl PUBLIC ${target})
     set_source_files_properties(${src} PROPERTIES
         COMPILE_OPTIONS "--embed-dir=${dir};-Wno-c23-extensions"
         OBJECT_DEPENDS ${lib})
