@@ -8,7 +8,7 @@
 #include <format>
 #include <fstream>
 #include <iterator>
-#include <limits>
+#include <queue>
 #include <variant>
 
 namespace mako::text {
@@ -444,29 +444,56 @@ void Tokenizer::bpe(const std::string& word, std::vector<int32_t>& out) const
             return;
         }
     }
-    // symbols are the UTF-8 characters of the byte-mapped word
-    std::vector<std::string> sym;
+    // symbols are the UTF-8 characters of the byte-mapped word, linked in order
+    struct Sym {
+        std::string s;
+        int32_t prev, next;
+    };
+    std::vector<Sym> syms;
     for (size_t i = 0; i < word.size();) {
         const auto b = static_cast<unsigned char>(word[i]);
         const size_t len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : 4;
-        sym.push_back(word.substr(i, len));
+        const auto n = int32_t(syms.size());
+        syms.push_back({word.substr(i, len), n - 1, n + 1});
         i += len;
     }
-    while (sym.size() > 1) {
-        int32_t best = std::numeric_limits<int32_t>::max();
-        size_t at = 0;
-        for (size_t i = 0; i + 1 < sym.size(); ++i) {
-            auto it = merge_rank_.find(sym[i] + " " + sym[i + 1]);
-            if (it != merge_rank_.end() && it->second < best) {
-                best = it->second;
-                at = i;
-            }
-        }
-        if (best == std::numeric_limits<int32_t>::max())
-            break;
-        sym[at] += sym[at + 1];
-        sym.erase(sym.begin() + std::ptrdiff_t(at) + 1);
+    if (!syms.empty())
+        syms.back().next = -1;
+    // The lowest rank merges first, the leftmost of equal ranks; an entry is stale once either symbol has changed
+    // (symbols only grow, so their lengths tell).
+    struct Pair {
+        int32_t rank, left, right;
+        size_t left_len, right_len;
+        bool operator>(const Pair& o) const { return rank != o.rank ? rank > o.rank : left > o.left; }
+    };
+    std::priority_queue<Pair, std::vector<Pair>, std::greater<>> queue;
+    const auto consider = [&](int32_t l) {
+        if (l < 0 || syms[size_t(l)].next < 0)
+            return;
+        const Sym &a = syms[size_t(l)], &b = syms[size_t(a.next)];
+        if (auto it = merge_rank_.find(a.s + " " + b.s); it != merge_rank_.end())
+            queue.push({it->second, l, a.next, a.s.size(), b.s.size()});
+    };
+    for (int32_t i = 0; i + 1 < int32_t(syms.size()); ++i)
+        consider(i);
+    while (!queue.empty()) {
+        const Pair p = queue.top();
+        queue.pop();
+        Sym& a = syms[size_t(p.left)];
+        if (a.next != p.right || a.s.size() != p.left_len || syms[size_t(p.right)].s.size() != p.right_len)
+            continue;
+        Sym& b = syms[size_t(p.right)];
+        a.s += b.s;
+        b.s.clear();
+        a.next = b.next;
+        if (a.next >= 0)
+            syms[size_t(a.next)].prev = p.left;
+        consider(a.prev);
+        consider(p.left);
     }
+    std::vector<std::string> sym;
+    for (int32_t i = syms.empty() ? -1 : 0; i >= 0; i = syms[size_t(i)].next)
+        sym.push_back(std::move(syms[size_t(i)].s));
     for (const auto& s : sym) {
         if (auto it = ids_.find(s); it != ids_.end()) {
             out.push_back(it->second);

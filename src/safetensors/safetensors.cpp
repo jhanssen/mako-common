@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -91,6 +92,15 @@ std::expected<File, std::string> File::open(const std::string& path)
     if (glz::read_json(j, text) || !j.is_object())
         return std::unexpected(path + ": bad header");
     const uint64_t data = 8 + header;
+    // A whole number from 0 to 2^53 (exact in a JSON double), else nullopt.
+    const auto count = [](const glz::generic& v) -> std::optional<uint64_t> {
+        if (!v.is_number())
+            return std::nullopt;
+        const double d = v.get_number();
+        if (!(d >= 0 && d <= 9007199254740992.0) || d != std::floor(d))
+            return std::nullopt;
+        return uint64_t(d);
+    };
     for (const auto& [name, t] : j.get_object()) {
         if (name == "__metadata__") {
             if (t.is_object())
@@ -99,7 +109,8 @@ std::expected<File, std::string> File::open(const std::string& path)
                         f.metadata_.emplace(k, v.get_string());
             continue;
         }
-        if (!t.is_object() || !t.contains("dtype") || !t.contains("shape") || !t.contains("data_offsets"))
+        if (!t.is_object() || !t.contains("dtype") || !t.contains("shape") || !t.contains("data_offsets") ||
+            !t["dtype"].is_string() || !t["shape"].is_array() || !t["data_offsets"].is_array())
             return std::unexpected(std::format("{}: bad entry {}", path, name));
         // Entries of other types (e.g. a batch norm's I64 counter) are left out: looking one up finds nothing.
         const auto type = type_of(t["dtype"].get_string());
@@ -109,17 +120,24 @@ std::expected<File, std::string> File::open(const std::string& path)
         g.name = name;
         g.type = *type;
         const auto& shape = t["shape"].get_array();
-        for (auto it = shape.rbegin(); it != shape.rend(); ++it)
-            g.dims.push_back(uint64_t(it->get_number()));
+        uint64_t elems = 1;
+        for (auto it = shape.rbegin(); it != shape.rend(); ++it) {
+            const auto d = count(*it);
+            if (!d || __builtin_mul_overflow(elems, *d, &elems) || elems > size)
+                return std::unexpected(std::format("{}: bad shape of {}", path, name));
+            g.dims.push_back(*d);
+        }
         if (g.dims.empty())
             g.dims.push_back(1);
         const auto& off = t["data_offsets"].get_array();
         if (off.size() != 2)
             return std::unexpected(std::format("{}: bad offsets of {}", path, name));
-        const uint64_t begin = uint64_t(off[0].get_number()), end = uint64_t(off[1].get_number());
-        g.offset = data + begin;
-        g.bytes = end - begin;
-        if (end < begin || g.offset + g.bytes > size || g.bytes != g.elements() * gguf::traits(g.type).block_bytes)
+        const auto begin = count(off[0]), end = count(off[1]);
+        if (!begin || !end || *end < *begin || *end > size - data)
+            return std::unexpected(std::format("{}: {} does not fit its shape or the file", path, name));
+        g.offset = data + *begin;
+        g.bytes = *end - *begin;
+        if (g.bytes != g.elements() * gguf::traits(g.type).block_bytes)
             return std::unexpected(std::format("{}: {} does not fit its shape or the file", path, name));
         f.by_name_.emplace(name, f.tensors_.size());
         f.tensors_.push_back(std::move(g));

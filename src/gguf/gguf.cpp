@@ -117,7 +117,7 @@ public:
             if (count > n_ - pos_)
                 throw ParseError{std::format("array of {} items at {} overruns the file", count, pos_)};
             Array a;
-            a.items.reserve(count);
+            a.items.reserve(std::min<uint64_t>(count, 1 << 16)); // the count is checked against the file only
             for (uint64_t i = 0; i < count; ++i)
                 a.items.push_back(value(et, depth + 1));
             return a;
@@ -166,14 +166,14 @@ std::expected<File, std::string> File::open(const std::string& path)
         const uint64_t n_tensors = r.get<uint64_t>();
         const uint64_t n_kv = r.get<uint64_t>();
 
-        f.kv_.reserve(n_kv);
+        f.kv_.reserve(std::min<uint64_t>(n_kv, 1 << 16));
         for (uint64_t i = 0; i < n_kv; ++i) {
             std::string key = r.str();
             Value v = r.value(static_cast<VType>(r.get<uint32_t>()));
             f.kv_.emplace_back(std::move(key), std::move(v));
         }
 
-        f.tensors_.reserve(n_tensors);
+        f.tensors_.reserve(std::min<uint64_t>(n_tensors, 1 << 16));
         for (uint64_t i = 0; i < n_tensors; ++i) {
             Tensor t;
             t.name = r.str();
@@ -188,6 +188,10 @@ std::expected<File, std::string> File::open(const std::string& path)
             if (tr.block_elems == 0)
                 return std::unexpected(std::format("{}: tensor {} has unknown type {}", path, t.name,
                                                    static_cast<uint32_t>(t.type)));
+            uint64_t elems = 1;
+            for (uint64_t d : t.dims)
+                if (__builtin_mul_overflow(elems, d, &elems) || elems > f.size_ * tr.block_elems)
+                    return std::unexpected(std::format("{}: tensor {} is larger than the file", path, t.name));
             if (t.dims[0] % tr.block_elems != 0)
                 return std::unexpected(std::format("{}: tensor {} row of {} is not whole {} blocks", path, t.name,
                                                    t.dims[0], tr.name));
@@ -204,10 +208,13 @@ std::expected<File, std::string> File::open(const std::string& path)
         for (auto& t : f.tensors_) {
             if (t.offset % align != 0)
                 return std::unexpected(std::format("{}: tensor {} offset {} is not aligned", path, t.name, t.offset));
-            t.offset += f.data_offset_;
+            if (__builtin_add_overflow(t.offset, f.data_offset_, &t.offset))
+                return std::unexpected(std::format("{}: tensor {} offset {} is past the file", path, t.name, t.offset));
         }
     } catch (const ParseError& e) {
         return std::unexpected(path + ": " + e.msg);
+    } catch (const std::exception& e) { // allocation for an implausible header
+        return std::unexpected(std::format("{}: {}", path, e.what()));
     }
 
     for (size_t i = 0; i < f.tensors_.size(); ++i)
@@ -297,7 +304,7 @@ const Tensor* File::tensor(std::string_view name) const
 
 std::span<const std::byte> File::data(const Tensor& t) const
 {
-    if (t.offset + t.bytes > size_)
+    if (t.bytes > size_ || t.offset > size_ - t.bytes)
         return {};
     return {map_ + t.offset, t.bytes};
 }
