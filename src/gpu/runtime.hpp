@@ -80,6 +80,9 @@ protected:
     // proj() of at least this many tokens uses the GEMM (fewer: the GEMV, which reads each weight once for them and
     // gives every token the same result as alone).
     uint32_t gemm_min_tokens_ = 5;
+    // BF16 matrices also multiply what rounding the activations to bfloat left out (a second GEMM): about 16 bits of
+    // the activations instead of 8, for values that cancel later (a text encoder's outlier channels).
+    bool bf16_split_ = false;
     // batch > 1: that many matrices from w on, each its own y block of t rows; x_shared: all read the same x.
     void gemv(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
               uint64_t y_off, uint32_t batch = 1, uint32_t t = 1, bool x_shared = false);

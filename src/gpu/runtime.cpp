@@ -158,6 +158,26 @@ void Runtime::proj(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffe
         MTL::Buffer* xb = scratch("xb", uint64_t(T) * k * 2);
         gemm_->to_bf16(enc, x, x_off, T, k, 0, xb, 0);
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, xb, 0, y, y_off, ldy);
+        if (bf16_split_) { // the rounding's remainder through the GEMM too
+            MTL::Buffer* lo = scratch("xb_lo", uint64_t(T) * k * 2);
+            MTL::Buffer* yl = scratch("y_lo", uint64_t(T) * n * 4);
+            const uint32_t la[2] = {k, k};
+            enc->setComputePipelineState(pso("bf16_lo"));
+            enc->setBuffer(x, x_off, 0);
+            enc->setBuffer(xb, 0, 1);
+            enc->setBuffer(lo, 0, 2);
+            enc->setBytes(la, sizeof(la), 3);
+            enc->dispatchThreads(MTL::Size(k, T, 1), MTL::Size(256, 1, 1));
+            after(enc, "bf16_lo");
+            gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, lo, 0, yl, 0);
+            const uint32_t aa[2] = {n, ldy ? ldy : n};
+            enc->setComputePipelineState(pso("add_rows"));
+            enc->setBuffer(y, y_off, 0);
+            enc->setBuffer(yl, 0, 1);
+            enc->setBytes(aa, sizeof(aa), 2);
+            enc->dispatchThreads(MTL::Size(n, T, 1), MTL::Size(256, 1, 1));
+            after(enc, "add_rows");
+        }
         if (tel_ == Telemetry::kernels)
             after(enc, std::format("gemm BF16 {}x{}", k, n));
         return;
@@ -233,7 +253,7 @@ void Runtime::ffn_dense(MTL::ComputeCommandEncoder*& enc, const Tensor& gate, co
     const uint64_t rows = uint64_t(T) * nff * 4;
     MTL::Buffer* gu = scratch("ffgu", 2 * rows); // gate rows, then up rows
     MTL::Buffer* m = scratch("ffm", rows);
-    if (T < gemm_min_tokens_ && adjacent(gate, up)) {
+    if (T < gemm_min_tokens_ && adjacent(gate, up) && !mtl::Gemm::bf16_input(gate.type)) { // BF16: the GEMM only
         gemv(enc, gate, xn, x_off, gu, 0, 2, T, true);
     } else {
         proj(enc, gate, xn, x_off, gu, 0, T);

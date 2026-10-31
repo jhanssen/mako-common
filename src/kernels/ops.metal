@@ -206,6 +206,7 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
         ushort);
 FLASH_ATTN_SG(128, 16, 32, 4)
 FLASH_ATTN_SG(256, 16, 32, 4)
+FLASH_ATTN_SG(64, 16, 32, 4)
 
 struct HeadsNormArgs {
     uint ld, col0, dim, n_pad, row0, rope; // as HeadsArgs
@@ -254,4 +255,23 @@ kernel void swiglu_rows(device const float* gu [[buffer(0)]], device float* m [[
         return;
     const float g = gu[uint64_t(gid.y) * 2 * n + gid.x], u = gu[uint64_t(gid.y) * 2 * n + n + gid.x];
     m[uint64_t(gid.y) * n + gid.x] = g / (1.0f + exp(-g)) * u;
+}
+
+// lo = bfloat(x - hi): what rounding x to bfloat (hi) left out, rows ldx floats apart. Grid (cols, rows).
+kernel void bf16_lo(device const float* x [[buffer(0)]], device const bfloat* hi [[buffer(1)]],
+                    device bfloat* lo [[buffer(2)]], constant uint2& a [[buffer(3)]],
+                    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= a.x)
+        return;
+    const uint64_t o = uint64_t(gid.y) * a.x + gid.x;
+    lo[o] = bfloat(x[uint64_t(gid.y) * a.y + gid.x] - float(hi[o]));
+}
+
+// y[r][i] += z[r][i] with y's rows ldy apart and z's dense. Grid (n, rows).
+kernel void add_rows(device float* y [[buffer(0)]], device const float* z [[buffer(1)]], constant uint2& a [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.x)
+        y[uint64_t(gid.y) * a.y + gid.x] += z[uint64_t(gid.y) * a.x + gid.x];
 }
