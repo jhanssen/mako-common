@@ -61,11 +61,17 @@ Cli& Cli::secret()
     return *this;
 }
 
-std::string Cli::env_name(std::string_view option)
+Cli& Cli::env_prefix(std::string prefix)
+{
+    env_prefix_ = std::move(prefix);
+    return *this;
+}
+
+std::string Cli::env_name(std::string_view option, std::string_view prefix)
 {
     if (!option.starts_with("--"))
         return {};
-    std::string name = "MAKO_";
+    std::string name(prefix);
     for (const char c : option.substr(2))
         name += c == '-' ? '_' : char(std::toupper(static_cast<unsigned char>(c)));
     return name;
@@ -131,13 +137,13 @@ std::string Cli::help() const
         if (spec.size() > 30)
             line += "\n" + std::string(32, ' ');
         line += o.help;
-        if (const auto e = env_name(o.name); !e.empty())
+        if (const auto e = env_name(o.name, env_prefix_); !e.empty())
             line += std::format("{}({})", o.help.empty() ? "" : " ", e);
         out += line + "\n";
     }
-    out += "  --preset NAME                 options from a preset (MAKO_PRESET)\n";
-    out += std::format("  --presets FILE                the presets file, default {} (MAKO_PRESETS)\n",
-                       presets_path().string());
+    out += std::format("  --preset NAME                 options from a preset ({}PRESET)\n", env_prefix_);
+    out += std::format("  --presets FILE                the presets file, default {} ({}PRESETS)\n",
+                       presets_path().string(), env_prefix_);
     return out;
 }
 
@@ -165,16 +171,16 @@ std::vector<std::string> Cli::parse(std::vector<std::string> in)
     // MAKO_PRESETS and MAKO_PRESET unless the command line names its own; the preset goes before the first option
     // (after leading positionals, so that a preset's model fills them only when the command line gives none).
     const auto has = [&](std::string_view a) { return std::ranges::find(in, a) != in.end(); };
-    if (const char* f = env("MAKO_PRESETS"); f && !has("--presets")) {
+    if (const char* f = env(env_prefix_ + "PRESETS"); f && !has("--presets")) {
         in.push_back("--presets");
         in.push_back(f);
-        std::println(stderr, "{}: --presets {} from MAKO_PRESETS", tool_, f);
+        std::println(stderr, "{}: --presets {} from {}PRESETS", tool_, f, env_prefix_);
     }
-    if (const char* p = env("MAKO_PRESET"); p && !has("--preset")) {
+    if (const char* p = env(env_prefix_ + "PRESET"); p && !has("--preset")) {
         auto at = std::find_if(in.begin() + 1, in.end(), [](const std::string& a) { return a.starts_with("-"); });
         at = in.insert(at, p);
         in.insert(at, "--preset");
-        std::println(stderr, "{}: --preset {} from MAKO_PRESET", tool_, p);
+        std::println(stderr, "{}: --preset {} from {}PRESET", tool_, p, env_prefix_);
     }
 
     std::vector<char*> ptrs;
@@ -210,7 +216,7 @@ std::vector<std::string> Cli::parse(std::vector<std::string> in)
 
     std::vector<Use> from_env;
     for (size_t k = 0; k < opts_.size(); ++k) {
-        const auto name = env_name(opts_[k].name);
+        const auto name = env_name(opts_[k].name, env_prefix_);
         const char* v = name.empty() || given.contains(opts_[k].group) ? nullptr : env(name);
         if (!v)
             continue;

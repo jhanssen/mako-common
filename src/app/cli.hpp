@@ -60,8 +60,11 @@ public:
     };
     std::vector<std::string> parse(std::vector<std::string> args);
 
+    // The variables' prefix, for each program its own (default MAKO_; MAKO_IMAGE_ makes --port MAKO_IMAGE_PORT, and
+    // --preset MAKO_IMAGE_PRESET).
+    Cli& env_prefix(std::string prefix);
     // The variable of a long option (--arena-gb: MAKO_ARENA_GB), empty for a short one.
-    static std::string env_name(std::string_view option);
+    static std::string env_name(std::string_view option, std::string_view prefix = "MAKO_");
 
     template <typename T> static T parse(const std::string& v)
     {
@@ -113,7 +116,7 @@ private:
     std::string usage() const;
     std::string help() const;
 
-    std::string tool_, positionals_;
+    std::string tool_, positionals_, env_prefix_ = "MAKO_";
     size_t min_positionals_, max_positionals_;
     std::vector<Opt> opts_;
 };

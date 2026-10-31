@@ -182,6 +182,28 @@ int main(int argc, char** argv)
               "an unknown preset");
     }
 
+    std::println("prefix");
+    {
+        setenv("MAKO_ZZ_COUNT", "3", 1);
+        setenv("ZZP_ZZ_COUNT", "8", 1);
+        Tool t;
+        auto c = t.cli();
+        c.env_prefix("ZZP_");
+        (void)c.parse(std::vector<std::string>{"m"});
+        check(t.count == 8, "another prefix reads its own variables, not MAKO_'s");
+        std::string help;
+        try {
+            (void)c.parse(std::vector<std::string>{"--help"});
+        } catch (const mako::app::Cli::Help& h) {
+            help = h.text;
+        }
+        check(mako::app::Cli::env_name("--zz-count", "ZZP_") == "ZZP_ZZ_COUNT" &&
+                  help.contains("(ZZP_ZZ_COUNT)") && help.contains("(ZZP_PRESET)"),
+              "env_name and --help with a prefix");
+        unsetenv("MAKO_ZZ_COUNT");
+        unsetenv("ZZP_ZZ_COUNT");
+    }
+
     if (failures) {
         std::println("{} failures", failures);
         return 1;
