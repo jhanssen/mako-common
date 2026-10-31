@@ -38,6 +38,12 @@ include(llama_cpp_sources)
 include(gemv_kernels)
 include(server_deps)
 include(mako_kernels)
+# What mako_add_kernels() reads, for the project calling it.
+if(NOT PROJECT_IS_TOP_LEVEL)
+    set(MAKO_COMMON_DIR ${MAKO_COMMON_DIR} PARENT_SCOPE)
+    set(GEMV_KERNELS_DIR ${GEMV_KERNELS_DIR} PARENT_SCOPE)
+    set(MAKO_COMMON_METAL_SOURCES ${MAKO_COMMON_METAL_SOURCES} PARENT_SCOPE)
+endif()
 
 set(S ${MAKO_COMMON_DIR}/src)
 
