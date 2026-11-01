@@ -6,6 +6,8 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 
+#include "rows.h"
+
 struct HeadsArgs {
     uint rows;     // tokens
     uint ld;       // x row stride in elements
@@ -274,4 +276,133 @@ kernel void add_rows(device float* y [[buffer(0)]], device const float* z [[buff
 {
     if (gid.x < a.x)
         y[uint64_t(gid.y) * a.y + gid.x] += z[uint64_t(gid.y) * a.x + gid.x];
+}
+
+// y = x / sqrt(mean(x^2) + eps) * w (w of n, or none when wn is 0), one threadgroup per row; n a multiple of 4.
+kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+                     device float* y [[buffer(2)]], constant NormArgs& a [[buffer(3)]],
+                     uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device const float4* xr = reinterpret_cast<device const float4*>(x + uint64_t(row) * a.n);
+    device float4* yr = reinterpret_cast<device float4*>(y + uint64_t(row) * (a.ystride ? a.ystride : a.n));
+    device const float4* w4 = reinterpret_cast<device const float4*>(w);
+    const uint n4 = a.n / 4;
+    float s = 0.0f;
+    for (uint i = tid; i < n4; i += TG) {
+        const float4 v = xr[i];
+        s += dot(v, v);
+    }
+    const float inv = rsqrt(tg_sum(s, scratch, tid) / float(a.n) + a.eps);
+    for (uint i = tid; i < n4; i += TG)
+        yr[i] = xr[i] * inv * (a.wn ? w4[i] : float4(1.0f));
+}
+
+struct ScanArgs {
+    uint head_dim;   // 128
+    uint tokens;
+    uint qkv_stride; // q, k, v elements between tokens
+    uint inner;      // g and o elements between tokens
+    uint heads;      // beta elements between tokens
+    uint snap;       // nonzero: also write the state after this many tokens to snap_state (for a rollback)
+};
+
+// One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
+//   S[i][:] *= exp(g[i]); delta[j] = (v[j] - sum_i S[i][j] k[i]) * beta
+//   S[i][j] += k[i] * delta[j];   o[j] = sum_i S[i][j] q[i] / sqrt(head_dim)
+// Threadgroups (heads, head_dim / 32) of 128 threads for rows j0..j0+31 of a head's M (rows are independent: row j
+// needs only the shared q, k, g and its own v[j]); four threads per row, each holding columns lane, lane + 4, ...
+// of it in registers for all the tokens. head_dim must be 128.
+kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+                     device const float* v [[buffer(2)]], device const float* g [[buffer(3)]],
+                     device const float* beta [[buffer(4)]], device float* state [[buffer(5)]],
+                     device float* o [[buffer(6)]], constant ScanArgs& a [[buffer(7)]],
+                     device float* snap_state [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint2 tid2 [[thread_position_in_threadgroup]])
+{
+    constexpr uint D = 128, ROWS = 32, LANES = 4, N = D / LANES;
+    threadgroup float qs[D], ks[D], eg[D];
+    const uint tid = tid2.x, h = tg.x, j0 = tg.y * ROWS, row = tid / LANES, lane = tid % LANES;
+    const uint base = h * D;
+    device float* Mg = state + uint64_t(h) * D * D + uint64_t(j0 + row) * D;
+    float M[N];
+    for (uint n = 0; n < N; ++n)
+        M[n] = Mg[lane + n * LANES];
+    for (uint t = 0; t < a.tokens; ++t) {
+        const uint64_t qo = uint64_t(t) * a.qkv_stride + base, go = uint64_t(t) * a.inner + base;
+        qs[tid] = q[qo + tid];
+        ks[tid] = k[qo + tid];
+        eg[tid] = exp(g[go + tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float sum = 0.0f;
+        for (uint n = 0; n < N; ++n) {
+            M[n] *= eg[lane + n * LANES];
+            sum += M[n] * ks[lane + n * LANES];
+        }
+        sum = quad_sum(sum);
+        const float delta = (v[qo + j0 + row] - sum) * beta[t * a.heads + h];
+        float out = 0.0f;
+        for (uint n = 0; n < N; ++n) {
+            M[n] += ks[lane + n * LANES] * delta;
+            out += M[n] * qs[lane + n * LANES];
+        }
+        out = quad_sum(out);
+        if (lane == 0)
+            o[go + j0 + row] = out * rsqrt(float(D));
+        if (t + 1 == a.snap) {
+            device float* Ss = snap_state + uint64_t(h) * D * D + uint64_t(j0 + row) * D;
+            for (uint n = 0; n < N; ++n)
+                Ss[lane + n * LANES] = M[n];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint n = 0; n < N; ++n)
+        Mg[lane + n * LANES] = M[n];
+}
+
+struct SwigluArgs {
+    uint n;
+    float limit;   // <= 0: no clamp
+};
+
+// y = silu(min(g, limit)) * clamp(u, -limit, limit); g and u are [rows][n].
+template <typename T>
+kernel void swiglu(device const float* gt [[buffer(0)]], device const float* up [[buffer(1)]],
+                   device T* y [[buffer(2)]], constant SwigluArgs& a [[buffer(3)]],
+                   uint i [[thread_position_in_grid]])
+{
+    if (i >= a.n)
+        return;
+    float g = gt[i], u = up[i];
+    if (a.limit > 0.0f) {
+        g = min(g, a.limit);
+        u = clamp(u, -a.limit, a.limit);
+    }
+    y[i] = T(g * sigmoidf(g) * u);
+}
+template [[host_name("swiglu")]] kernel void swiglu<float>(device const float*, device const float*, device float*,
+                                                          constant SwigluArgs&, uint);
+template [[host_name("swiglu_half")]] kernel void swiglu<half>(device const float*, device const float*, device half*,
+                                                              constant SwigluArgs&, uint);
+
+kernel void add(device const float* x [[buffer(0)]], device const float* z [[buffer(1)]],
+                device float* y [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]])
+{
+    if (i < n)
+        y[i] = x[i] + z[i];
+}
+
+// y[t * ldy + i] = x[t * n + i]; grid (n, rows).
+kernel void copy_rows(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint2& a [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < a.x)
+        y[uint64_t(gid.y) * a.y + gid.x] = x[uint64_t(gid.y) * a.x + gid.x];
+}
+
+kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                     constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]])
+{
+    if (i < n)
+        y[i] = x[i];
 }

@@ -15,7 +15,8 @@ function(mako_add_kernels target)
             COMMAND ${CMAKE_COMMAND} -E make_directory ${dir}
             COMMAND xcrun -sdk macosx metal -std=metal4.0 -Wall -Werror -I ${GEMV_KERNELS_DIR}
                     -I ${MAKO_COMMON_DIR}/src/kernels -c ${src} -o ${air}
-            DEPENDS ${src} ${GEMV_KERNELS_DIR}/ggml-common.h ${MAKO_COMMON_DIR}/src/kernels/moe_route.h ${K_DEPENDS}
+            DEPENDS ${src} ${GEMV_KERNELS_DIR}/ggml-common.h ${MAKO_COMMON_DIR}/src/kernels/moe_route.h
+                    ${MAKO_COMMON_DIR}/src/kernels/rows.h ${K_DEPENDS}
             COMMENT "Compiling ${stem}.metal")
         list(APPEND airs ${air})
     endforeach()
