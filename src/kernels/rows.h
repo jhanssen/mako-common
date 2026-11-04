@@ -6,7 +6,7 @@ using namespace metal;
 constant uint TG = 256;
 
 // Sum of `v` over a threadgroup of TG threads; every thread gets the total.
-static float tg_sum(float v, threadgroup float* scratch, uint tid)
+[[maybe_unused]] static float tg_sum(float v, threadgroup float* scratch, uint tid)
 {
     v = simd_sum(v);
     if (tid % 32 == 0)
@@ -19,7 +19,7 @@ static float tg_sum(float v, threadgroup float* scratch, uint tid)
     return total;
 }
 
-static float sigmoidf(float x) { return 1.0f / (1.0f + exp(-x)); }
+[[maybe_unused]] static float sigmoidf(float x) { return 1.0f / (1.0f + exp(-x)); }
 
 struct NormArgs {
     uint n;       // row length

@@ -406,3 +406,139 @@ kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buff
     if (i < n)
         y[i] = x[i];
 }
+
+// y[r][i] += b[i]. Grid (n, rows).
+kernel void bias_rows(device float* y [[buffer(0)]], device const float* b [[buffer(1)]], constant uint& n [[buffer(2)]],
+                      uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < n)
+        y[uint64_t(gid.y) * n + gid.x] += b[gid.x];
+}
+
+struct HeadsPartialArgs {
+    uint ld, col0; // x rows ld apart; head h at col0 + h * stride
+    uint stride;
+    uint dim;      // per head (at most 256)
+    uint rot;      // the first rot values rotate, i with i + rot / 2 (0: none)
+    uint n_pad;    // rows of a head in y
+    float eps;     // 0: no norm
+};
+
+// y[h][t][d] = half of head h of row t, RMS-normed (times w) when eps is set, its first rot values rotated by
+// cs[t][i] = (cos, sin). Threadgroups (rows, heads) of dim threads.
+kernel void heads_partial(device const float* x [[buffer(0)]], device const float2* cs [[buffer(1)]],
+                          device half* y [[buffer(2)]], device const float* w [[buffer(3)]],
+                          constant HeadsPartialArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          uint i [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float vals[256];
+    threadgroup float part[8];
+    const uint t = tg.x, h = tg.y;
+    float v = x[uint64_t(t) * a.ld + a.col0 + h * a.stride + i];
+    if (a.eps > 0.0f) {
+        const float s = simd_sum(v * v);
+        if (lane == 0)
+            part[sg] = s;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.0f;
+        for (uint j = 0; j < a.dim / 32; ++j)
+            total += part[j];
+        v *= rsqrt(total / float(a.dim) + a.eps) * w[i];
+    }
+    vals[i] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i < a.rot) {
+        const uint half_rot = a.rot / 2, p = i % half_rot;
+        const float2 c = cs[uint64_t(t) * half_rot + p];
+        v = i < half_rot ? vals[i] * c.x - vals[i + half_rot] * c.y : vals[i] * c.x + vals[i - half_rot] * c.y;
+    }
+    y[(uint64_t(h) * a.n_pad + t) * a.dim + i] = half(v);
+}
+
+struct LoraArgs {
+    uint k, rows, rank; // the matrix's row length, the rows adapted, the adapter's rank
+    uint b_rot;         // row r of the matrix takes B's row (r + b_rot) % rows
+    float scale;
+};
+
+// W[r][c] += scale * sum_j B[(r + b_rot) % rows][j] * A[j][c] over BF16 (or F16) rows of W (from the adapted ones
+// on), in float, rounded back. Grid (k, rows).
+template <typename T>
+kernel void lora_merge(device T* w [[buffer(0)]], device const float* a [[buffer(1)]], device const float* b [[buffer(2)]],
+                       constant LoraArgs& p [[buffer(3)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint c = gid.x, r = gid.y;
+    if (c >= p.k || r >= p.rows)
+        return;
+    const uint br = (r + p.b_rot) % p.rows;
+    float d = 0.0f;
+    for (uint j = 0; j < p.rank; ++j)
+        d += b[uint64_t(br) * p.rank + j] * a[uint64_t(j) * p.k + c];
+    device T* x = w + uint64_t(r) * p.k + c;
+    *x = T(float(*x) + p.scale * d);
+}
+template [[host_name("lora_merge")]] kernel void lora_merge<bfloat>(device bfloat*, device const float*,
+                                                                    device const float*, constant LoraArgs&, uint2);
+template [[host_name("lora_merge_f16")]] kernel void lora_merge<half>(device half*, device const float*,
+                                                                      device const float*, constant LoraArgs&, uint2);
+
+struct LnAffineArgs {
+    uint n;
+    float eps;
+};
+
+// y = layer_norm(x) * (1 + scale) + shift over each row (no learned weights); one threadgroup per row.
+kernel void ln_affine(device const float* x [[buffer(0)]], device const float* scale [[buffer(1)]],
+                      device const float* shift [[buffer(2)]], device float* y [[buffer(3)]],
+                      constant LnAffineArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device const float* xr = x + uint64_t(row) * a.n;
+    device float* yr = y + uint64_t(row) * a.n;
+    float s = 0.0f;
+    for (uint i = tid; i < a.n; i += TG)
+        s += xr[i];
+    const float mean = tg_sum(s, scratch, tid) / float(a.n);
+    float v = 0.0f;
+    for (uint i = tid; i < a.n; i += TG) {
+        const float d = xr[i] - mean;
+        v += d * d;
+    }
+    const float inv = rsqrt(tg_sum(v, scratch, tid) / float(a.n) + a.eps);
+    for (uint i = tid; i < a.n; i += TG)
+        yr[i] = (xr[i] - mean) * inv * (1.0f + scale[i]) + shift[i];
+}
+
+// y = layer_norm(x) * w + b over each row; one threadgroup per row.
+kernel void layer_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+                       device const float* b [[buffer(2)]], device float* y [[buffer(3)]],
+                       constant LnAffineArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device const float* xr = x + uint64_t(row) * a.n;
+    device float* yr = y + uint64_t(row) * a.n;
+    float s = 0.0f;
+    for (uint i = tid; i < a.n; i += TG)
+        s += xr[i];
+    const float mean = tg_sum(s, scratch, tid) / float(a.n);
+    float v = 0.0f;
+    for (uint i = tid; i < a.n; i += TG) {
+        const float d = xr[i] - mean;
+        v += d * d;
+    }
+    const float inv = rsqrt(tg_sum(v, scratch, tid) / float(a.n) + a.eps);
+    for (uint i = tid; i < a.n; i += TG)
+        yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+}
+
+// x += g * y over rows of n (g: [n]). Grid (n, rows).
+kernel void scale_add(device float* x [[buffer(0)]], device const float* y [[buffer(1)]],
+                      device const float* g [[buffer(2)]], constant uint& n [[buffer(3)]],
+                      uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x < n)
+        x[uint64_t(gid.y) * n + gid.x] += g[gid.x] * y[uint64_t(gid.y) * n + gid.x];
+}
