@@ -96,4 +96,5 @@ target_link_libraries(mako_memory PUBLIC mako_log PRIVATE glaze_headers httplib_
 if(PROJECT_IS_TOP_LEVEL)
     enable_testing()
     add_subdirectory(tests)
+    add_subdirectory(bench)
 endif()

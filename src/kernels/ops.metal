@@ -207,6 +207,8 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
         device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, \
         ushort);
 FLASH_ATTN_SG(128, 16, 32, 4)
+// 64 keys a pass for 128-wide heads: the same at 4k keys, 12% faster at 19k (384 -> 336 ms for 56 heads).
+FLASH_ATTN_SG(128, 16, 64, 4)
 FLASH_ATTN_SG(256, 16, 32, 4)
 FLASH_ATTN_SG(64, 16, 32, 4)
 

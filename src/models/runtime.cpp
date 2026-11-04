@@ -246,7 +246,7 @@ void TransformerRuntime::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer
         throw std::runtime_error(std::format("attention: heads of {}", dim));
     const AttnArgs a{n_q, q_pad, n_k, k_pad, n_heads, kv_heads, q_pos0, block, n_heads * dim,
                      1.0f / std::sqrt(float(dim))};
-    dispatch(enc, std::format("flash_attn_sg_{}_16x32_4", dim), {q, k, v, o}, &a, sizeof(a),
+    dispatch(enc, std::format("flash_attn_sg_{}_16x{}_4", dim, dim == 128 ? 64 : 32), {q, k, v, o}, &a, sizeof(a),
              MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
 }
 

@@ -287,6 +287,13 @@ GEMM_DENSE("bf16", bfloat, 128)
 GEMM_DENSE("f16d", half, 32)
 GEMM_DENSE("f16d", half, 64)
 GEMM_DENSE("f16d", half, 128)
+// 64 x 128 tiles for many tokens: the activations are read once per 128 columns instead of 64, which is what
+// bounds the wide and long shapes (19456 tokens x 14336 -> 5376: 103 -> 54 ms; x 5376 -> 28672: 141 -> 99 ms; 256-row
+// tiles with 8 simdgroups were slower).
+template [[host_name("gemm_bf16_64x128")]] kernel void gemm_dense<bfloat, 64, 128, 4, 64>(
+    device const bfloat*, device const bfloat*, device float*, constant GemmArgs&, uint2);
+template [[host_name("gemm_f16d_64x128")]] kernel void gemm_dense<half, 64, 128, 4, 64>(
+    device const half*, device const half*, device float*, constant GemmArgs&, uint2);
 
 // Few-token GEMM for IQ2_XXS, IQ2_S and IQ3_XXS weights: each weight is read and dequantized once per NT tokens, in
 // registers, and multiplied with every token (the tiled GEMM above dequantizes into threadgroup memory and runs a

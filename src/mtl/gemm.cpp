@@ -83,7 +83,9 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
     if (type == gguf::Type::BF16 || (direct && type == gguf::Type::F16)) {
         if (k % 64)
             throw std::runtime_error(std::format("dense GEMM: k={} is not a multiple of 64", k));
-        const uint32_t bm = t <= 32 ? 32 : t <= 64 ? 64 : 128, bn = 64;
+        // Past 64 tokens, 64 x 128 tiles where n allows: half the passes over the activations.
+        const bool wide = t > 64 && n % 128 == 0;
+        const uint32_t bm = t <= 32 ? 32 : t <= 64 || wide ? 64 : 128, bn = wide ? 128 : 64;
         enc->setComputePipelineState(
             pso(std::format("{}_{}x{}", type == gguf::Type::BF16 ? "gemm_bf16" : "gemm_f16d", bm, bn)));
         enc->setBuffer(w, w_off, 0);
