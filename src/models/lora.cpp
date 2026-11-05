@@ -146,7 +146,7 @@ uint32_t TransformerRuntime::add_lora(const std::string& path, float scale, std:
     if (!unknown.empty())
         throw std::runtime_error(std::format("{}: {} keys {} does not adapt, e.g. {}", path, unknown.size(), name(),
                                              unknown.front()));
-    uint32_t done = 0, rank_seen = 0, side = 0;
+    uint32_t done = 0, rank_seen = 0, side = 0, skipped = 0;
     for (const auto& [m, p] : mods) {
         const LoraTarget tg = lora_target(m);
         if (!tg.w) { // a small matrix on the CPU: W += s * B A there
@@ -169,6 +169,10 @@ uint32_t TransformerRuntime::add_lora(const std::string& path, float scale, std:
         }
         const uint32_t k = uint32_t(tg.w->dims[0]), rank = uint32_t(p.a->dims[1]);
         // A is [rank][k] and B [rows][rank] (row-major), so their contiguous dimensions come first here.
+        if (tg.optional && p.a->dims[0] != k) {
+            ++skipped;
+            continue;
+        }
         if (p.a->dims[0] != k || p.b->dims[0] != rank || p.b->dims[1] != tg.rows ||
             (tg.w->type != gguf::Type::BF16 && tg.w->type != gguf::Type::F16 && tg.w->type != gguf::Type::I8))
             throw std::runtime_error(std::format("{}: {} does not fit the weight it adapts", path, m));
@@ -232,8 +236,11 @@ uint32_t TransformerRuntime::add_lora(const std::string& path, float scale, std:
     if (!done)
         throw std::runtime_error(path + ": no LoRA weights in it");
     lora_merged();
-    log::info("LoRA {}: {} tensors adapted ({} kept unmerged; rank {}, alpha {}), scale {}", path, done, side,
-              rank_seen, alpha ? std::format("{}", *alpha) : std::string("= rank"), scale);
+    log::info("LoRA {}: {} tensors adapted ({} kept unmerged; rank {}, alpha {}), scale {}{}", path, done, side,
+              rank_seen, alpha ? std::format("{}", *alpha) : std::string("= rank"), scale,
+              skipped ? std::format("; {} skipped: made for the full model's modulation projections, which this "
+                                    "pruned checkpoint folds into 8 coordinates", skipped)
+                      : std::string());
     return done;
 }
 

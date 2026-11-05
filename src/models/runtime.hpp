@@ -116,6 +116,9 @@ protected:
     struct LoraTarget {
         Tensor* w = nullptr;
         uint32_t row0 = 0, rows = 0, b_rot = 0;
+        // An adapter whose width does not fit this matrix is skipped (and counted) instead of refused: a full
+        // model's modulation adapter on a pruned checkpoint, whose projections take 8 coordinates.
+        bool optional = false;
     };
     // `module` with the file's prefixes stripped (transformer., diffusion_model., ...); none: not adapted.
     virtual LoraTarget lora_target(const std::string& /*module*/) { return {}; }
