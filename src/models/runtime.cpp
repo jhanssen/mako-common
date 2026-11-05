@@ -21,6 +21,7 @@ struct HeadsNormArgs {
 struct HeadsPartialArgs {
     uint32_t ld, col0, stride, dim, rot, n_pad;
     float eps;
+    uint32_t mapped;
 };
 struct AttnArgs {
     uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
@@ -241,17 +242,19 @@ void TransformerRuntime::heads_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffe
 
 void TransformerRuntime::heads_partial(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint32_t ld, uint32_t col0,
                                        uint32_t stride, uint32_t dim, uint32_t rot, uint32_t n_heads, uint32_t T,
-                                       uint32_t n_pad, MTL::Buffer* cs, const Tensor* w, float eps, MTL::Buffer* y)
+                                       uint32_t n_pad, MTL::Buffer* cs, const Tensor* w, float eps, MTL::Buffer* y,
+                                       MTL::Buffer* map)
 {
     if (dim > 256 || dim % 32 || rot % 2)
         throw std::runtime_error(std::format("heads_partial: heads of {} with {} rotated", dim, rot));
-    const HeadsPartialArgs a{ld, col0, stride, dim, rot, n_pad, w ? eps : 0.0f};
+    const HeadsPartialArgs a{ld, col0, stride, dim, rot, n_pad, w ? eps : 0.0f, map ? 1u : 0u};
     enc->setComputePipelineState(pso("heads_partial"));
     enc->setBuffer(x, 0, 0);
     enc->setBuffer(cs ? cs : x, 0, 1);
     enc->setBuffer(y, 0, 2);
     enc->setBuffer(w ? w->buf : x, w ? w->off : 0, 3);
     enc->setBytes(&a, sizeof(a), 4);
+    enc->setBuffer(map ? map : x, 0, 5);
     enc->dispatchThreadgroups(MTL::Size(T, n_heads, 1), MTL::Size(dim, 1, 1));
     after(enc, "heads_partial");
 }
@@ -267,6 +270,49 @@ void TransformerRuntime::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer
     // 64 and 128-wide heads: the four simdgroups cooperating on 64 rows; 256-wide: each on its own 16.
     dispatch(enc, dim == 256 ? std::string("flash_attn_sg_256_16x32_4") : std::format("flash_attn_coop_{}_32", dim),
              {q, k, v, o}, &a, sizeof(a), MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
+}
+
+namespace {
+struct CubeArgs {
+    uint32_t n_cubes, k_pad, dim, topk;
+};
+struct SparseAttnArgs {
+    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, width;
+    float scale;
+    uint32_t n_cubes, max_sel, dense0, dense1;
+};
+} // namespace
+
+void TransformerRuntime::cube_select(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, uint32_t heads,
+                                     uint32_t k_pad, uint32_t n_cubes, MTL::Buffer* cnt, uint32_t topk,
+                                     MTL::Buffer*& sel, MTL::Buffer*& nsel)
+{
+    if (n_cubes > 4096 || !topk)
+        throw std::runtime_error(std::format("cube_select: {} cubes, top {}", n_cubes, topk));
+    const CubeArgs a{n_cubes, k_pad, kHeadDim, std::min(topk, n_cubes)};
+    MTL::Buffer* qp = scratch("c_qp", uint64_t(heads) * n_cubes * kHeadDim * 4);
+    MTL::Buffer* kp = scratch("c_kp", uint64_t(heads) * n_cubes * kHeadDim * 4);
+    MTL::Buffer* sc = scratch("c_sc", uint64_t(heads) * n_cubes * n_cubes * 4);
+    sel = scratch("c_sel", uint64_t(heads) * n_cubes * a.topk * 2);
+    nsel = scratch("c_nsel", uint64_t(heads) * n_cubes * 2);
+    dispatch(enc, "cube_pool", {q, cnt, qp}, &a, sizeof(a), MTL::Size(kHeadDim, n_cubes, heads), MTL::Size(128, 1, 1));
+    dispatch(enc, "cube_pool", {k, cnt, kp}, &a, sizeof(a), MTL::Size(kHeadDim, n_cubes, heads), MTL::Size(128, 1, 1));
+    dispatch(enc, "cube_scores", {qp, kp, sc}, &a, sizeof(a), MTL::Size(n_cubes, n_cubes, heads), MTL::Size(64, 1, 1));
+    dispatch(enc, "cube_topk", {sc, sel, nsel}, &a, sizeof(a), MTL::Size(n_cubes, heads, 1), MTL::Size(256, 1, 1), false);
+}
+
+void TransformerRuntime::attention_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k,
+                                          MTL::Buffer* v, MTL::Buffer* o, uint32_t n_q, uint32_t q_pad, uint32_t n_k,
+                                          uint32_t k_pad, uint32_t heads, uint32_t kv_heads, uint32_t width,
+                                          uint32_t n_cubes, uint32_t topk, uint32_t dense0, uint32_t dense1,
+                                          MTL::Buffer* sel, MTL::Buffer* nsel, MTL::Buffer* valid, MTL::Buffer* map)
+{
+    if (q_pad % kAttnRows || k_pad % 128 || dense0 % 32)
+        throw std::runtime_error("attention_sparse: q_pad a multiple of 64, k_pad of 128, the dense rows from a multiple of 32");
+    const SparseAttnArgs a{n_q, q_pad, n_k, k_pad, heads, kv_heads, width, 1.0f / std::sqrt(float(kHeadDim)),
+                           n_cubes, std::min(topk, n_cubes), dense0, dense1};
+    dispatch(enc, "flash_attn_sparse_128", {q, k, v, o, sel, nsel, valid, map}, &a, sizeof(a),
+             MTL::Size(q_pad / kAttnRows, heads, 1), MTL::Size(128, 1, 1), false);
 }
 
 } // namespace mako::models

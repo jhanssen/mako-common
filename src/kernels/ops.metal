@@ -580,19 +580,24 @@ struct HeadsPartialArgs {
     uint rot;      // the first rot values rotate, i with i + rot / 2 (0: none)
     uint n_pad;    // rows of a head in y
     float eps;     // 0: no norm
+    uint mapped;   // row t of y comes from x row map[t] (and its angles), a zero row where map[t] < 0
 };
 
 // y[h][t][d] = half of head h of row t, RMS-normed (times w) when eps is set, its first rot values rotated by
 // cs[t][i] = (cos, sin). Threadgroups (rows, heads) of dim threads.
 kernel void heads_partial(device const float* x [[buffer(0)]], device const float2* cs [[buffer(1)]],
                           device half* y [[buffer(2)]], device const float* w [[buffer(3)]],
-                          constant HeadsPartialArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
-                          uint i [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]])
+                          constant HeadsPartialArgs& a [[buffer(4)]], device const int* map [[buffer(5)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]])
 {
     threadgroup float vals[256];
     threadgroup float part[8];
-    const uint t = tg.x, h = tg.y;
+    const uint t = a.mapped ? uint(map[tg.x]) : tg.x, h = tg.y;
+    if (a.mapped && map[tg.x] < 0) {
+        y[(uint64_t(h) * a.n_pad + tg.x) * a.dim + i] = 0.0h;
+        return;
+    }
     float v = x[uint64_t(t) * a.ld + a.col0 + h * a.stride + i];
     if (a.eps > 0.0f) {
         const float s = simd_sum(v * v);
@@ -611,7 +616,7 @@ kernel void heads_partial(device const float* x [[buffer(0)]], device const floa
         const float2 c = cs[uint64_t(t) * half_rot + p];
         v = i < half_rot ? vals[i] * c.x - vals[i + half_rot] * c.y : vals[i] * c.x + vals[i - half_rot] * c.y;
     }
-    y[(uint64_t(h) * a.n_pad + t) * a.dim + i] = half(v);
+    y[(uint64_t(h) * a.n_pad + tg.x) * a.dim + i] = half(v);
 }
 
 struct LoraArgs {
@@ -878,4 +883,257 @@ kernel void gelu_erf(device float* x [[buffer(0)]], constant uint& n [[buffer(1)
 {
     if (i < n)
         x[i] = 0.5f * x[i] * (1.0f + erf_fit(x[i] * 0.70710678f));
+}
+
+// Block-sparse attention for video transformers (Video Sparse Attention's training-free form): the video rows sit
+// in 64-row cubes (4 latent frames x 4 x 4 patches, padded rows marked invalid), each cube's queries attend the
+// cubes a coarse pass picks (mean-pooled q and k per cube scored against each other, the top k per head) plus the
+// dense rows (text, conditions, audio) after the cubes; the dense rows' queries attend everything.
+
+struct CubeArgs {
+    uint n_cubes, k_pad, dim; // cubes of 64 rows; rows of a head in the tiles; the head width
+    uint topk;                // cube_topk: cubes kept per query cube
+};
+
+// out[h][c][d] = mean over the cube's valid rows of x[h][c * 64 + r][d] (cnt[c] valid rows). Grid (dim, cubes, heads).
+kernel void cube_pool(device const half* x [[buffer(0)]], device const uint* cnt [[buffer(1)]],
+                      device float* out [[buffer(2)]], constant CubeArgs& a [[buffer(3)]],
+                      uint3 gid [[thread_position_in_grid]])
+{
+    const uint d = gid.x, c = gid.y, h = gid.z;
+    if (d >= a.dim || c >= a.n_cubes)
+        return;
+    float s = 0.0f;
+    device const half* p = x + (uint64_t(h) * a.k_pad + uint64_t(c) * 64) * a.dim + d;
+    for (uint r = 0; r < 64; ++r)
+        s += float(p[uint64_t(r) * a.dim]);
+    out[(uint64_t(h) * a.n_cubes + c) * a.dim + d] = cnt[c] ? s / float(cnt[c]) : 0.0f;
+}
+
+// sc[h][qc][kc] = qp[h][qc] . kp[h][kc]. Grid (cubes (kc), cubes (qc), heads).
+kernel void cube_scores(device const float* qp [[buffer(0)]], device const float* kp [[buffer(1)]],
+                        device float* sc [[buffer(2)]], constant CubeArgs& a [[buffer(3)]],
+                        uint3 gid [[thread_position_in_grid]])
+{
+    const uint kc = gid.x, qc = gid.y, h = gid.z;
+    if (kc >= a.n_cubes || qc >= a.n_cubes)
+        return;
+    device const float* q = qp + (uint64_t(h) * a.n_cubes + qc) * a.dim;
+    device const float* k = kp + (uint64_t(h) * a.n_cubes + kc) * a.dim;
+    float s = 0.0f;
+    for (uint d = 0; d < a.dim; d += 4)
+        s += q[d] * k[d] + q[d + 1] * k[d + 1] + q[d + 2] * k[d + 2] + q[d + 3] * k[d + 3];
+    sc[(uint64_t(h) * a.n_cubes + qc) * a.n_cubes + kc] = s;
+}
+
+// sel[h][qc][0 .. topk) = the key cubes with the largest scores for query cube qc (the largest first), nsel[h][qc] how
+// many (fewer when there are fewer cubes). One threadgroup of 256 per (qc, h); at most 4096 cubes.
+kernel void cube_topk(device const float* sc [[buffer(0)]], device ushort* sel [[buffer(1)]],
+                      device ushort* nsel [[buffer(2)]], constant CubeArgs& a [[buffer(3)]],
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float scores[4096];
+    threadgroup float best_v[8];
+    threadgroup uint best_i[8];
+    const uint qc = tg.x, h = tg.y, n = a.n_cubes;
+    device const float* row = sc + (uint64_t(h) * n + qc) * n;
+    for (uint i = tid; i < n; i += 256)
+        scores[i] = row[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint k = min(a.topk, n);
+    for (uint it = 0; it < k; ++it) {
+        float v = -INFINITY;
+        uint idx = 0;
+        for (uint i = tid; i < n; i += 256)
+            if (scores[i] > v) {
+                v = scores[i];
+                idx = i;
+            }
+        // The simdgroup's best, then the threadgroup's: the larger score, the smaller index on ties.
+        for (uint o = 16; o > 0; o >>= 1) {
+            const float ov = simd_shuffle_xor(v, o);
+            const uint oi = simd_shuffle_xor(idx, o);
+            if (ov > v || (ov == v && oi < idx)) {
+                v = ov;
+                idx = oi;
+            }
+        }
+        if (lane == 0) {
+            best_v[sg] = v;
+            best_i[sg] = idx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float bv = best_v[0];
+            uint bi = best_i[0];
+            for (uint j = 1; j < 8; ++j)
+                if (best_v[j] > bv || (best_v[j] == bv && best_i[j] < bi)) {
+                    bv = best_v[j];
+                    bi = best_i[j];
+                }
+            sel[(uint64_t(h) * n + qc) * a.topk + it] = ushort(bi);
+            scores[bi] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0)
+        nsel[uint64_t(h) * n + qc] = ushort(k);
+}
+
+struct SparseAttnArgs {
+    uint n_q, q_pad, n_k, k_pad, heads, kv_heads, width; // as AttnArgs (rows in the tiles' order)
+    float scale;
+    uint n_cubes, max_sel;  // the first n_cubes query tiles are cubes; sel rows hold max_sel entries
+    uint dense0, dense1;    // the dense rows [dense0, dense1), attended by every cube's queries
+};
+
+// flash_attn_coop over a pass list: query tile qt < n_cubes visits its selected key cubes (two passes each) and the
+// dense rows; a later tile visits every key. Keys with valid[j] == 0 (padding) are masked. The output goes to row
+// map[q] of o (the tiles' order mapped back to the model's; rows with map[q] < 0 are dropped).
+kernel void flash_attn_sparse_128(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                                  device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
+                                  device const ushort* sel [[buffer(4)]], device const ushort* nsel [[buffer(5)]],
+                                  device const uchar* valid [[buffer(6)]], device const int* map [[buffer(7)]],
+                                  constant SparseAttnArgs& a [[buffer(8)]], uint2 tg [[threadgroup_position_in_grid]],
+                                  ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]])
+{
+#pragma METAL fp math_mode(relaxed)
+    constexpr int D = 128, R = 64, NSG = 4, K = 32, CAP = R * K / 128, ACAP = R * D / 128, CQ = K / 32, AQ = D / 32;
+    threadgroup half p_all[2][R * K];
+    threadgroup float pmax[2][2][R];
+    threadgroup float lsum[2][R];
+    const uint qt = tg.x, q0 = qt * R, h = tg.y, kvh = h / (a.heads / a.kv_heads);
+    if (q0 >= a.n_q)
+        return;
+    const uint64_t qhead = uint64_t(h) * a.q_pad * D, khead = uint64_t(kvh) * a.k_pad * D;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + qhead + uint64_t(q0) * D,
+                                                                dextents<int32_t, 2>(D, R));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tk(const_cast<device half*>(k) + khead,
+                                                                dextents<int32_t, 2>(D, int(a.k_pad)));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tv(const_cast<device half*>(v) + khead,
+                                                                dextents<int32_t, 2>(D, int(a.k_pad)));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp0(p_all[0], dextents<int32_t, 2>(K, R));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp1(p_all[1], dextents<int32_t, 2>(K, R));
+    constexpr auto qk_desc = matmul2d_descriptor(R, K, D, false, true, false, matmul2d_descriptor::mode::multiply);
+    constexpr auto pv_desc =
+        matmul2d_descriptor(R, D, K, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroups<NSG>> qk;
+    matmul2d<pv_desc, execution_simdgroups<NSG>> pv;
+    auto kt0 = tk.slice(0, 0);
+    auto sc = qk.template get_destination_cooperative_tensor<decltype(tq), decltype(kt0), float>();
+    auto vt0 = tv.slice(0, 0);
+    auto acc = pv.template get_destination_cooperative_tensor<decltype(tp0), decltype(vt0), float>();
+    for (uint16_t i = 0; i < ACAP; ++i)
+        acc[i] = 0.0f;
+    const uint sgx = sg & 1, sgy = sg >> 1;
+    const uint r0 = ((lane >> 1) & 3) | ((lane >> 4) << 2) | (sgy << 4);
+    const uint c_base = 4 * ((lane & 1) + 2 * ((lane >> 3) & 1)) + 16 * sgx;
+    const bool writer = (lane & 9) == 0;
+    const float scale = a.scale * 1.4426950408889634f;
+    // The passes: a cube's selected key cubes, two of 32 keys each, then the dense rows; a dense tile's all keys.
+    const bool cube = qt < a.n_cubes;
+    const uint ns = cube ? uint(nsel[uint64_t(h) * a.n_cubes + qt]) : 0;
+    device const ushort* my_sel = sel + (uint64_t(h) * a.n_cubes + qt) * a.max_sel;
+    const uint dense_passes = cube ? (a.dense1 - a.dense0 + K - 1) / K : (a.n_k + K - 1) / K;
+    const uint n_pass = 2 * ns + dense_passes;
+    float m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, l[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint buf = 0;
+    for (uint p = 0; p < n_pass; ++p) {
+        uint j0, hi;
+        if (p < 2 * ns) {
+            j0 = uint(my_sel[p >> 1]) * 2 * K + (p & 1) * K;
+            hi = j0 + K;
+        } else if (cube) {
+            j0 = a.dense0 + (p - 2 * ns) * K;
+            hi = min(j0 + K, a.dense1);
+        } else {
+            j0 = p * K;
+            hi = min(j0 + K, a.n_k);
+        }
+        for (uint16_t i = 0; i < CAP; ++i)
+            sc[i] = 0.0f;
+        auto kt = tk.slice(0, int(j0));
+        qk.run(tq, kt, sc);
+        float mt[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        for (uint16_t i = 0; i < CAP; ++i) {
+            const uint slot = ((i >> 2) & 1) | ((i / (8 * CQ)) << 1);
+            const uint j = j0 + ((i >> 3) % CQ) * 32 + c_base + (i & 3);
+            float x = sc[i] * scale;
+            if (j >= hi || valid[j] == 0)
+                x = -INFINITY;
+            sc[i] = x;
+            mt[slot] = max(mt[slot], x);
+        }
+        for (int s = 0; s < 4; ++s) {
+            mt[s] = max(mt[s], simd_shuffle_xor(mt[s], 1));
+            mt[s] = max(mt[s], simd_shuffle_xor(mt[s], 8));
+        }
+        if (writer)
+            for (int s = 0; s < 4; ++s)
+                pmax[buf][sgx][r0 + (s & 1) * 8 + (s >> 1) * 32] = mt[s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        bool rescale = false;
+        float f[4];
+        for (int s = 0; s < 4; ++s) {
+            mt[s] = max(mt[s], pmax[buf][sgx ^ 1][r0 + (s & 1) * 8 + (s >> 1) * 32]);
+            f[s] = 1.0f;
+            if (mt[s] > m[s] + 8.0f) {
+                f[s] = m[s] == -INFINITY ? 0.0f : exp2(m[s] - mt[s]);
+                m[s] = mt[s];
+                l[s] *= f[s];
+                rescale = true;
+            }
+        }
+        if (simd_any(rescale))
+            for (uint16_t i = 0; i < ACAP; ++i)
+                acc[i] *= f[((i >> 2) & 1) | ((i / (8 * AQ)) << 1)];
+        threadgroup half* pp = p_all[buf];
+        for (uint16_t i = 0; i < CAP; i += 4) {
+            const uint slot = ((i >> 2) & 1) | ((i / (8 * CQ)) << 1);
+            const uint row = r0 + (slot & 1) * 8 + (slot >> 1) * 32, col = ((i >> 3) % CQ) * 32 + c_base;
+            const float mm = m[slot];
+            half4 e;
+            float sum = 0.0f;
+            for (int c = 0; c < 4; ++c) {
+                const float ex = mm == -INFINITY ? 0.0f : exp2(sc[i + c] - mm);
+                e[c] = half(ex);
+                sum += ex;
+            }
+            *reinterpret_cast<threadgroup half4*>(pp + row * K + col) = e;
+            l[slot] += sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto vt = tv.slice(0, int(j0));
+        if (buf == 0)
+            pv.run(tp0, vt, acc);
+        else
+            pv.run(tp1, vt, acc);
+        buf ^= 1;
+    }
+    for (int s = 0; s < 4; ++s) {
+        l[s] += simd_shuffle_xor(l[s], 1);
+        l[s] += simd_shuffle_xor(l[s], 8);
+    }
+    if (writer)
+        for (int s = 0; s < 4; ++s)
+            lsum[sgx][r0 + (s & 1) * 8 + (s >> 1) * 32] = l[s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv[4];
+    for (int s = 0; s < 4; ++s) {
+        const float total = l[s] + lsum[sgx ^ 1][r0 + (s & 1) * 8 + (s >> 1) * 32];
+        inv[s] = total > 0.0f ? 1.0f / total : 0.0f;
+    }
+    // Each lane's rows are r0 + {0, 8, 32, 40} of the tile; element i's column ((i >> 3) % AQ) * 32 + c_base + (i & 3).
+    for (uint16_t i = 0; i < ACAP; ++i) {
+        const uint slot = ((i >> 2) & 1) | ((i / (8 * AQ)) << 1);
+        const uint row = q0 + r0 + (slot & 1) * 8 + (slot >> 1) * 32;
+        if (row >= a.n_q)
+            continue;
+        const int dst = map[row];
+        if (dst < 0)
+            continue;
+        const uint col = ((i >> 3) % AQ) * 32 + c_base + (i & 3);
+        o[uint64_t(dst) * a.width + h * D + col] = acc[i] * inv[slot];
+    }
 }

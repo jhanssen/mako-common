@@ -86,13 +86,25 @@ protected:
     // [heads][n_pad][dim].
     void heads_partial(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, uint32_t ld, uint32_t col0, uint32_t stride,
                        uint32_t dim, uint32_t rot, uint32_t heads, uint32_t T, uint32_t n_pad, MTL::Buffer* cs,
-                       const Tensor* w, float eps, MTL::Buffer* y);
+                       const Tensor* w, float eps, MTL::Buffer* y, MTL::Buffer* map = nullptr);
     // Flash attention over half tiles q [heads][q_pad][dim], k and v [kv_heads][k_pad][dim] into o [n_q][heads *
     // dim] floats. block: positions from here on see each other both ways; below it, causal (0: all both ways).
     // dim 64, 128 or 256.
     void attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v, MTL::Buffer* o,
                    uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad, uint32_t heads, uint32_t kv_heads,
                    uint32_t q_pos0, uint32_t block, uint32_t dim = kHeadDim);
+    // Block-sparse attention over 128-wide heads for a sequence whose first n_cubes * 64 rows are 64-row cubes of
+    // video tokens (padding rows with valid 0) and whose rows [dense0, dense1) are the others: cube_select picks, per
+    // head and query cube, the `topk` key cubes by the dot product of the cubes' mean q and k (cnt[c]: a cube's valid
+    // rows), into sel [heads][n_cubes][topk] and nsel; attention_sparse then attends each cube's queries to those
+    // cubes and the dense rows, the dense rows' queries to everything, and writes query row r's output to o row
+    // map[r] (map[r] < 0: dropped). q, k, v as attention() takes them (q_pad a multiple of 64, k_pad of 128).
+    void cube_select(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, uint32_t heads, uint32_t k_pad,
+                     uint32_t n_cubes, MTL::Buffer* cnt, uint32_t topk, MTL::Buffer*& sel, MTL::Buffer*& nsel);
+    void attention_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v,
+                          MTL::Buffer* o, uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad, uint32_t heads,
+                          uint32_t kv_heads, uint32_t width, uint32_t n_cubes, uint32_t topk, uint32_t dense0,
+                          uint32_t dense1, MTL::Buffer* sel, MTL::Buffer* nsel, MTL::Buffer* valid, MTL::Buffer* map);
 
     // The weight a LoRA module adapts: its matrix and the rows it has there (fused matrices share one); b_rot: the
     // adapter's up rows rotated onto them (row r takes up row (r + b_rot) % rows: a fused matrix whose halves the
