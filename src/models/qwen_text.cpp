@@ -168,7 +168,7 @@ void QwenText::embed(std::span<const int32_t> ids, float* out) const
 }
 
 std::vector<float> QwenText::encode(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps,
-                                    bool normed)
+                                    bool normed, std::span<const Vision> vision)
 {
     const uint32_t T = uint32_t(ids.size()), E = E_, kv = kv_ * kHeadDim, qw = heads_ * kHeadDim;
     if (T <= drop)
@@ -195,19 +195,77 @@ std::vector<float> QwenText::encode(std::span<const int32_t> ids, uint32_t drop,
     MTL::Buffer* cs = scratch("t_cs", uint64_t(T) * pairs * 8);
     MTL::Buffer* out = scratch("t_out", uint64_t(T) * nt * E * 4);
     embed(ids, static_cast<float*>(x->contents()));
-    // Text positions are the same on the three rotary axes, which makes the multi-axis rotation the plain one.
+    // Every token's position on the three rotary axes (time, height, width): a text token's the same on all three,
+    // which makes the multi-axis rotation the plain one; an image's tokens take their row and column. With
+    // interleaved sections of 24, 20 and 20 pairs, pair i turns by the time axis when i % 3 == 0 or i >= 60, the
+    // height axis when i % 3 == 1, the width axis when i % 3 == 2 (Qwen3-VL's M-RoPE; the plain rotation otherwise).
+    std::vector<std::array<uint32_t, 3>> pos(T);
+    {
+        uint32_t cur = 0, t = 0;
+        size_t vi = 0;
+        while (t < T) {
+            if (vi < vision.size() && vision[vi].first == t) {
+                const Vision& v = vision[vi++];
+                if (t + uint64_t(v.rows) * v.cols > T || v.embeds.size() != uint64_t(v.rows) * v.cols * E)
+                    throw std::runtime_error("text encoder: an image's tokens do not fit the sequence");
+                if (v.deepstack.size() != kDeepstack)
+                    throw std::runtime_error("text encoder: an image needs its three DeepStack features");
+                std::memcpy(static_cast<float*>(x->contents()) + uint64_t(t) * E, v.embeds.data(), v.embeds.size() * 4);
+                for (uint32_t k = 0; k < v.rows * v.cols; ++k, ++t)
+                    pos[t] = {cur, cur + k / v.cols, cur + k % v.cols};
+                cur += std::max(v.rows, v.cols);
+                continue;
+            }
+            pos[t++] = {cur, cur, cur};
+            ++cur;
+        }
+        if (vi != vision.size())
+            throw std::runtime_error("text encoder: an image starts past the sequence or out of order");
+    }
+    const bool mrope = !vision.empty() && !qwen35_;
     auto* c = static_cast<float*>(cs->contents());
     for (uint32_t t = 0; t < T; ++t)
         for (uint32_t i = 0; i < pairs; ++i) {
             const float inv = 1.0f / std::pow(theta_, float(2 * i) / float(rot_));
-            const float ang = float(t) * inv;
+            const uint32_t axis = mrope && i < 60 ? i % 3 : 0;
+            const float ang = float(pos[t][axis]) * inv;
             c[(uint64_t(t) * pairs + i) * 2] = std::cos(ang);
             c[(uint64_t(t) * pairs + i) * 2 + 1] = std::sin(ang);
         }
+    // The DeepStack features, added after the first layers.
+    MTL::Buffer* ds = nullptr;
+    if (!vision.empty()) {
+        uint64_t total = 0;
+        for (const Vision& v : vision)
+            total += uint64_t(v.rows) * v.cols * E;
+        ds = scratch("t_ds", total * kDeepstack * 4);
+        auto* d = static_cast<float*>(ds->contents());
+        for (uint32_t layer = 0; layer < kDeepstack; ++layer)
+            for (const Vision& v : vision) {
+                if (v.deepstack[layer].size() != uint64_t(v.rows) * v.cols * E)
+                    throw std::runtime_error("text encoder: a DeepStack feature of the wrong size");
+                std::memcpy(d, v.deepstack[layer].data(), v.deepstack[layer].size() * 4);
+                d += v.deepstack[layer].size();
+            }
+    }
 
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     cur_cb_ = cb;
     MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    auto deepstack = [&](uint32_t layer) {
+        if (!ds || layer >= kDeepstack)
+            return;
+        uint64_t off = 0;
+        for (uint32_t l = 0; l < layer; ++l)
+            for (const Vision& v : vision)
+                off += uint64_t(v.rows) * v.cols * E;
+        for (const Vision& v : vision) {
+            const uint32_t n = v.rows * v.cols * E;
+            dispatch_at(enc, "add", {Arg{x, uint64_t(v.first) * E * 4}, Arg{ds, off * 4}, Arg{x, uint64_t(v.first) * E * 4}},
+                        &n, sizeof(n), MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+            off += n;
+        }
+    };
     // The first token's outlier channels grow to thousands and cancel in the last layers: activations in bfloat
     // alone leave its final state a few percent off.
     bf16_split_ = true;
@@ -238,6 +296,7 @@ std::vector<float> QwenText::encode(std::span<const int32_t> ids, uint32_t drop,
             norm(enc, x, &L.ffn_norm, xn, T, E, E, eps_);
             ffn_dense(enc, L.gate, L.up, L.down, xn, y, 0.0f, T);
             add(enc, x, y, x, T * E);
+            deepstack(il);
             tap(il + 1);
             continue;
         }
@@ -255,6 +314,7 @@ std::vector<float> QwenText::encode(std::span<const int32_t> ids, uint32_t drop,
         norm(enc, x, &L.ffn_norm, xn, T, E, E, eps_);
         ffn_dense(enc, L.gate, L.up, L.down, xn, y, 0.0f, T);
         add(enc, x, y, x, T * E);
+        deepstack(il);
         tap(il + 1);
     }
     if (normed) {

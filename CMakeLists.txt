@@ -75,7 +75,7 @@ target_link_libraries(mako_safetensors PUBLIC mako_gguf PRIVATE glaze_headers)
 # The transformer models' common ground: weights from safetensors, attention heads and flash attention, LoRAs, and the
 # Qwen text encoders the image and video models condition on.
 add_library(mako_models STATIC ${S}/models/runtime.cpp ${S}/models/lora.cpp ${S}/models/qwen_text.cpp
-            ${S}/models/conv.cpp)
+            ${S}/models/conv.cpp ${S}/models/qwen_vision.cpp)
 target_include_directories(mako_models PUBLIC ${S})
 target_link_libraries(mako_models PUBLIC mako_gpu mako_safetensors mako_log PRIVATE glaze_headers)
 

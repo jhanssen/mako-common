@@ -25,11 +25,22 @@ public:
 
     const char* name() const override { return "text encoder"; }
 
+    // An image in the sequence (Qwen3-VL): its merged tokens from `first` (rows * cols of them, row-major over the
+    // merged grid), their features [rows * cols][E] in place of the pad tokens' embeddings, and the DeepStack
+    // features [rows * cols][E] added to the hidden states after each of the first layers, one per layer. The
+    // image's rotary positions are three-axis: the time axis at the position before it, the height and width axes
+    // offset by the token's row and column; the text after it continues from the larger of rows and columns on.
+    struct Vision {
+        uint32_t first = 0, rows = 0, cols = 0;
+        std::span<const float> embeds;
+        std::vector<std::span<const float>> deepstack;
+    };
     // Rows [drop, n) of the last layer's output before the final norm ([n - drop][E]) or after it (normed), or with
     // taps, of the hidden states listed (0: the embeddings, i: layer i's output), [n - drop][taps][E].
     std::vector<float> encode(std::span<const int32_t> ids, uint32_t drop, std::span<const uint32_t> taps = {},
-                              bool normed = false);
+                              bool normed = false, std::span<const Vision> vision = {});
     uint32_t width() const { return E_; }
+    static constexpr uint32_t kDeepstack = 3; // layers an image's DeepStack features go into
     uint32_t layers() const { return uint32_t(layers_.size()); }
     bool qwen35() const { return qwen35_; }
 
