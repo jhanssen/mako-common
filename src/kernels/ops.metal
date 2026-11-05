@@ -891,7 +891,7 @@ kernel void gelu_erf(device float* x [[buffer(0)]], constant uint& n [[buffer(1)
 // dense rows (text, conditions, audio) after the cubes; the dense rows' queries attend everything.
 
 struct CubeArgs {
-    uint n_cubes, k_pad, dim; // cubes of 64 rows; rows of a head in the tiles; the head width
+    uint n_cubes, k_pad, dim; // cubes of 64 rows; rows of a head in the tiles pooled (q's and k's can differ); the width
     uint topk;                // cube_topk: cubes kept per query cube
 };
 

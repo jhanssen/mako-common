@@ -11,6 +11,7 @@
 #include <format>
 #include <print>
 #include <random>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -42,7 +43,7 @@ int main()
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     mako::mtl::Context ctx;
     Harness h(ctx);
-    constexpr uint32_t D = 128, heads = 2, cubes = 6, dense = 100, topk = 3;
+    constexpr uint32_t D = 128, heads = 2, cubes = 6, dense = 60, topk = 3; // 444 rows: q padded to 448, k to 512
     const uint32_t cnt[cubes] = {64, 64, 64, 64, 64, 20};
     const uint32_t n = cubes * 64 + dense, q_pad = (n + 63) / 64 * 64, k_pad = (n + 127) / 128 * 128;
     const uint32_t dense0 = cubes * 64, dense1 = n;
@@ -59,17 +60,19 @@ int main()
     // Random half tiles [heads][k_pad][D]; invalid rows zero, as the mapped heads kernel writes them.
     std::mt19937 rng(7);
     std::normal_distribution<float> nd;
+    // q's tiles have rows q_pad apart per head, k's and v's k_pad; the CPU side keeps everything k_pad apart.
     std::vector<float> qf(uint64_t(heads) * k_pad * D), kf(qf.size()), vf(qf.size());
-    auto qb = h.scratch("t_q", qf.size() * 2), kb = h.scratch("t_k", qf.size() * 2), vb = h.scratch("t_v", qf.size() * 2);
-    for (auto [f, b] : {std::pair{&qf, qb}, std::pair{&kf, kb}, std::pair{&vf, vb}}) {
+    auto qb = h.scratch("t_q", uint64_t(heads) * q_pad * D * 2), kb = h.scratch("t_k", qf.size() * 2),
+         vb = h.scratch("t_v", qf.size() * 2);
+    for (auto [f, b, pad] : {std::tuple{&qf, qb, q_pad}, std::tuple{&kf, kb, k_pad}, std::tuple{&vf, vb, k_pad}}) {
         auto* hp = static_cast<__fp16*>(b->contents());
         for (uint32_t hh = 0; hh < heads; ++hh)
             for (uint32_t r = 0; r < k_pad; ++r)
                 for (uint32_t d = 0; d < D; ++d) {
-                    const uint64_t i = (uint64_t(hh) * k_pad + r) * D + d;
                     const __fp16 x = __fp16(valid[r] ? nd(rng) : 0.0f);
-                    hp[i] = x;
-                    (*f)[i] = float(x);
+                    if (r < pad)
+                        hp[(uint64_t(hh) * pad + r) * D + d] = x;
+                    (*f)[(uint64_t(hh) * k_pad + r) * D + d] = float(x);
                 }
     }
     auto cntb = h.scratch("t_cnt", cubes * 4);
@@ -86,7 +89,7 @@ int main()
         MTL::CommandBuffer* cb = h.ctx_.queue()->commandBuffer();
         h.cur_cb_ = cb;
         MTL::ComputeCommandEncoder* enc = h.encoder(cb, 0, -1);
-        h.cube_select(enc, qb, kb, heads, k_pad, cubes, cntb, topk, sel, nsel);
+        h.cube_select(enc, qb, kb, heads, q_pad, k_pad, cubes, cntb, topk, sel, nsel);
         h.attention_sparse(enc, qb, kb, vb, ob, n, q_pad, n, k_pad, heads, heads, heads * D, cubes, topk, dense0, dense1,
                            sel, nsel, validb, mapb);
         enc->endEncoding();

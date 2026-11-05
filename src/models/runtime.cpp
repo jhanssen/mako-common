@@ -284,18 +284,18 @@ struct SparseAttnArgs {
 } // namespace
 
 void TransformerRuntime::cube_select(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, uint32_t heads,
-                                     uint32_t k_pad, uint32_t n_cubes, MTL::Buffer* cnt, uint32_t topk,
+                                     uint32_t q_pad, uint32_t k_pad, uint32_t n_cubes, MTL::Buffer* cnt, uint32_t topk,
                                      MTL::Buffer*& sel, MTL::Buffer*& nsel)
 {
     if (n_cubes > 4096 || !topk)
         throw std::runtime_error(std::format("cube_select: {} cubes, top {}", n_cubes, topk));
-    const CubeArgs a{n_cubes, k_pad, kHeadDim, std::min(topk, n_cubes)};
+    const CubeArgs a{n_cubes, k_pad, kHeadDim, std::min(topk, n_cubes)}, aq{n_cubes, q_pad, kHeadDim, a.topk};
     MTL::Buffer* qp = scratch("c_qp", uint64_t(heads) * n_cubes * kHeadDim * 4);
     MTL::Buffer* kp = scratch("c_kp", uint64_t(heads) * n_cubes * kHeadDim * 4);
     MTL::Buffer* sc = scratch("c_sc", uint64_t(heads) * n_cubes * n_cubes * 4);
     sel = scratch("c_sel", uint64_t(heads) * n_cubes * a.topk * 2);
     nsel = scratch("c_nsel", uint64_t(heads) * n_cubes * 2);
-    dispatch(enc, "cube_pool", {q, cnt, qp}, &a, sizeof(a), MTL::Size(kHeadDim, n_cubes, heads), MTL::Size(128, 1, 1));
+    dispatch(enc, "cube_pool", {q, cnt, qp}, &aq, sizeof(aq), MTL::Size(kHeadDim, n_cubes, heads), MTL::Size(128, 1, 1));
     dispatch(enc, "cube_pool", {k, cnt, kp}, &a, sizeof(a), MTL::Size(kHeadDim, n_cubes, heads), MTL::Size(128, 1, 1));
     dispatch(enc, "cube_scores", {qp, kp, sc}, &a, sizeof(a), MTL::Size(n_cubes, n_cubes, heads), MTL::Size(64, 1, 1));
     dispatch(enc, "cube_topk", {sc, sel, nsel}, &a, sizeof(a), MTL::Size(n_cubes, heads, 1), MTL::Size(256, 1, 1), false);
