@@ -17,7 +17,7 @@ struct Im2colArgs {
 } // namespace
 
 ConvRuntime::Conv ConvRuntime::load_conv(const safetensors::Files& files, std::span<const std::string> names,
-                                         uint32_t k)
+                                         uint32_t k, bool temporal)
 {
     struct Part {
         safetensors::Files::Ref r;
@@ -45,7 +45,12 @@ ConvRuntime::Conv ConvRuntime::load_conv(const safetensors::Files& files, std::s
         parts.push_back({r, uint32_t(r.tensor->dims[nd - 1]), nd == 5 ? uint32_t(r.tensor->dims[2]) : 1});
         c.cout += parts.back().cout;
     }
-    const uint32_t cols = c.cin * k * k, kk = k * k;
+    if (temporal)
+        for (const Part& p : parts)
+            if (p.kt != 3)
+                throw std::runtime_error(names.front() + ": not a 3D convolution with three time taps");
+    c.kt = temporal ? 3 : 1;
+    const uint32_t cols = c.cin * c.kt * k * k, kk = k * k;
     // 3x3: the unfolded rows padded for the direct GEMM; 1x1: the input's own rows (the staged GEMM where they are not
     // a multiple of 64).
     c.kpad = round_up(cols, k == 3 ? 64 : 32);
@@ -57,7 +62,7 @@ ConvRuntime::Conv ConvRuntime::load_conv(const safetensors::Files& files, std::s
     uint32_t o0 = 0;
     for (size_t pi = 0; pi < parts.size(); ++pi) {
         const Part& p = parts[pi];
-        std::vector<float> row(uint64_t(cols) * p.kt);
+        std::vector<float> row(uint64_t(c.cin) * p.kt * kk); // one output channel's weights as the file lays them out
         const gguf::Type type = p.r.tensor->type;
         std::vector<uint16_t> raw(type != gguf::Type::F32 ? row.size() : 0);
         for (uint32_t o = 0; o < p.cout; ++o) {
@@ -78,10 +83,12 @@ ConvRuntime::Conv ConvRuntime::load_conv(const safetensors::Files& files, std::s
                     }
                 }
             }
+            // Columns (channel, time tap, tap) with all taps, as the file lays a row out; the last time tap's
+            // (channel, tap) otherwise.
             for (uint32_t i = 0; i < c.kpad; ++i) {
                 float v = 0.0f;
                 if (i < cols)
-                    v = row[(uint64_t(i / kk) * p.kt + p.kt - 1) * kk + i % kk];
+                    v = temporal ? row[i] : row[(uint64_t(i / kk) * p.kt + p.kt - 1) * kk + i % kk];
                 dst[uint64_t(o0 + o) * c.kpad + i] = __fp16(v);
             }
         }
@@ -90,6 +97,31 @@ ConvRuntime::Conv ConvRuntime::load_conv(const safetensors::Files& files, std::s
         o0 += p.cout;
     }
     return c;
+}
+
+void ConvRuntime::conv3d(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* x, uint32_t T, uint32_t h,
+                         uint32_t w, uint32_t ts, MTL::Buffer* y)
+{
+    if (c.kt != 3 || c.k != 3 || (ts != 1 && ts != 2))
+        throw std::runtime_error("conv3d: a 3x3x3 convolution at time stride 1 or 2");
+    const uint32_t oh = c.stride == 2 ? (h + c.pad - 2) / 2 + 1 : h, ow = c.stride == 2 ? (w + c.pad - 2) / 2 + 1 : w;
+    const uint32_t rows = oh * ow, To = frames_out(T, ts);
+    const uint32_t chunk = std::max(256u, uint32_t((256ull << 20) / (uint64_t(c.kpad) * 2)) / 256 * 256);
+    MTL::Buffer* col = scratch("v_col", uint64_t(std::min(chunk, rows)) * c.kpad * 2);
+    for (uint32_t to = 0; to < To; ++to) {
+        for (uint32_t p0 = 0; p0 < rows; p0 += chunk) {
+            const uint32_t n = std::min(chunk, rows - p0);
+            // The first time tap reads frame to * ts - 2 (negative: the causal zero padding).
+            const int32_t a[12] = {int32_t(h), int32_t(w), int32_t(c.cin), int32_t(p0), int32_t(n), int32_t(c.kpad),
+                                   int32_t(c.mode), int32_t(ow), int32_t(c.stride), int32_t(c.stride == 2 ? c.pad : 1),
+                                   int32_t(to * ts) - 2, int32_t(T)};
+            dispatch(enc, "im2col3d", {x, col}, a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
+            gemm_->encode(enc, gguf::Type::F16, c.kpad, c.cout, n, c.w.buf, c.w.off, col, 0, y,
+                          (uint64_t(to) * rows + p0) * c.cout * 4, 0, 0, true);
+            after(enc, "conv3x3x3");
+        }
+        bias(enc, y, c.b, c.cout, rows, uint64_t(to) * rows * c.cout * 4);
+    }
 }
 
 void ConvRuntime::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buffer* x, uint32_t h, uint32_t w,
@@ -139,7 +171,8 @@ void ConvRuntime::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buf
 }
 
 void ConvRuntime::group_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& g, const Tensor& b,
-                             MTL::Buffer* y, uint32_t rows, uint32_t c, bool silu, float eps)
+                             MTL::Buffer* y, uint32_t rows, uint32_t c, bool silu, float eps, uint64_t x_off,
+                             uint64_t y_off)
 {
     struct {
         uint32_t rows, c, groups, chunk;
@@ -149,14 +182,15 @@ void ConvRuntime::group_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, c
     const uint32_t chunks = (rows + a.chunk - 1) / a.chunk;
     MTL::Buffer* part = scratch("gn_part", uint64_t(chunks) * c * 8);
     MTL::Buffer* stats = scratch("gn_stats", 32 * 8);
-    dispatch(enc, "gn_partial", {x, part}, &a, sizeof(a), MTL::Size(c, chunks, 1), MTL::Size(std::min(c, 256u), 1, 1));
+    dispatch_at(enc, "gn_partial", {Arg{x, x_off}, Arg{part, 0}}, &a, sizeof(a), MTL::Size(c, chunks, 1),
+                MTL::Size(std::min(c, 256u), 1, 1));
     dispatch(enc, "gn_stats", {part, stats}, &a, sizeof(a), MTL::Size(32, 1, 1), MTL::Size(32, 1, 1));
     enc->setComputePipelineState(pso("gn_apply"));
-    enc->setBuffer(x, 0, 0);
+    enc->setBuffer(x, x_off, 0);
     enc->setBuffer(stats, 0, 1);
     enc->setBuffer(g.buf, g.off, 2);
     enc->setBuffer(b.buf, b.off, 3);
-    enc->setBuffer(y, 0, 4);
+    enc->setBuffer(y, y_off, 4);
     enc->setBytes(&a, sizeof(a), 5);
     enc->dispatchThreads(MTL::Size(c, rows, 1), MTL::Size(std::min(c, 256u), 1, 1));
     after(enc, "gn_apply");

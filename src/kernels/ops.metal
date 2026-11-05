@@ -779,6 +779,32 @@ kernel void im2col3x3(device const float* x [[buffer(0)]], device half* out [[bu
 
 // im2col3x3 for a stride-2 convolution (padding 1): output pixel p0 + r = (y, x) of an ow-wide image reads input
 // pixels (2y + ky - 1, 2x + kx - 1) of the h x w input. Grid (kpad, rows).
+// im2col for a 3x3x3 convolution over frames [T][h][w][c], causal in time: output pixel p0 + r = (y, x) of frame
+// `frame` reads input frames f0 + kt (kt 0..2; f0 = the output frame's time * time stride - 2; frames outside
+// [0, T) are the zero padding), pixels (stride * y + ky - pad, stride * x + kx - pad) with the spatial padding mode
+// (stride 2: pad above and left `pad`, below and right the mode's); columns (channel, kt, ky * 3 + kx). Grid (kpad,
+// rows).
+struct Im2col3dArgs {
+    int h, w, c, p0, rows, kpad, mode, ow, stride, pad, f0, T;
+};
+kernel void im2col3d(device const float* x [[buffer(0)]], device half* out [[buffer(1)]],
+                     constant Im2col3dArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const int col = int(gid.x), r = int(gid.y);
+    if (col >= a.kpad || r >= a.rows)
+        return;
+    float v = 0.0f;
+    if (col < 27 * a.c) {
+        const int ch = col / 27, kt = (col / 9) % 3, kk = col % 9, p = a.p0 + r;
+        const int f = a.f0 + kt;
+        const int y = pad_coord((p / a.ow) * a.stride + kk / 3 - a.pad, a.h, uint(a.mode));
+        const int xx = pad_coord((p % a.ow) * a.stride + kk % 3 - a.pad, a.w, uint(a.mode));
+        if (f >= 0 && f < a.T && y >= 0 && y < a.h && xx >= 0 && xx < a.w)
+            v = x[((uint64_t(f) * a.h + y) * a.w + xx) * a.c + ch];
+    }
+    out[uint64_t(r) * a.kpad + col] = half(v);
+}
+
 struct Im2colS2Args {
     uint h, w, c, p0, rows, kpad, ow;
     uint pad;  // above and left of the image: 1, or 0 (then only below and right)

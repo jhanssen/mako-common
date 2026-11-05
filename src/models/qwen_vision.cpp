@@ -171,16 +171,19 @@ void QwenVision::merge(MTL::ComputeCommandEncoder*& enc, const Merger& mg, MTL::
     bias(enc, out, mg.fc2_b, kOut, m);
 }
 
-QwenVision::Features QwenVision::encode(std::span<const uint8_t> rgb, uint32_t h, uint32_t w)
+QwenVision::Features QwenVision::encode(std::span<const uint8_t> first, std::span<const uint8_t> second, uint32_t h,
+                                        uint32_t w)
 {
     const uint32_t gh = h / kPatch, gw = w / kPatch;
-    if (!h || !w || h % (kPatch * kMerge) || w % (kPatch * kMerge) || rgb.size() != uint64_t(h) * w * 3)
-        throw std::runtime_error("vision tower: an image [h][w][3] with h and w multiples of 32");
+    if (!h || !w || h % (kPatch * kMerge) || w % (kPatch * kMerge) || first.size() != uint64_t(h) * w * 3 ||
+        second.size() != first.size())
+        throw std::runtime_error("vision tower: frames [h][w][3] with h and w multiples of 32");
+    const std::span<const uint8_t> taps[2] = {first, second};
     const uint32_t n = gh * gw, m = n / (kMerge * kMerge), bw = gw / kMerge;
     const uint32_t q_pad = round_up(n, kAttnRows), k_pad = round_up(n, 128);
     // The patches in block order (2x2 merge blocks row-major, the patches within a block row-major), each its
-    // [3][2][16][16] values in [-1, 1] with the two time taps alike, as the image processor lays them out; their
-    // position embeddings and rope angles from their (row, column) in the patch grid.
+    // [3][2][16][16] values in [-1, 1], a frame a time tap, as the processors lay them out; their position
+    // embeddings and rope angles from their (row, column) in the patch grid.
     MTL::Buffer* pix = scratch("v_pix", uint64_t(n) * kPixels * 4);
     MTL::Buffer* pos = scratch("v_pos", uint64_t(n) * kDim * 4);
     MTL::Buffer* cs = scratch("v_cs", uint64_t(n) * (kHeadDim / 2) * 8);
@@ -199,7 +202,7 @@ QwenVision::Features QwenVision::encode(std::span<const uint8_t> rgb, uint32_t h
                 for (uint32_t y = 0; y < kPatch; ++y)
                     for (uint32_t x = 0; x < kPatch; ++x)
                         p[((c * 2 + t) * kPatch + y) * kPatch + x] =
-                            float(rgb[((uint64_t(row) * kPatch + y) * w + col * kPatch + x) * 3 + c]) / 127.5f - 1.0f;
+                            float(taps[t][((uint64_t(row) * kPatch + y) * w + col * kPatch + x) * 3 + c]) / 127.5f - 1.0f;
         // Bilinear, corners aligned: the grid's 0..47 over the patch rows 0..gh - 1.
         const double sy = gh > 1 ? double(row) * (kGrid - 1) / double(gh - 1) : 0.0;
         const double sx = gw > 1 ? double(col) * (kGrid - 1) / double(gw - 1) : 0.0;

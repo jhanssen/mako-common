@@ -33,8 +33,10 @@ public:
         std::vector<float> embeds;   // [rows * cols][5120]
         std::array<std::vector<float>, kDeepstack> deepstack;
     };
-    // 8-bit RGB [h][w][3].
-    Features encode(std::span<const uint8_t> rgb, uint32_t h, uint32_t w);
+    // 8-bit RGB [h][w][3]: an image (both time taps the frame), or a video's frame pair (the first frame in the
+    // first time tap, the second in the other; Qwen3-VL attends each pair on its own).
+    Features encode(std::span<const uint8_t> rgb, uint32_t h, uint32_t w) { return encode(rgb, rgb, h, w); }
+    Features encode(std::span<const uint8_t> first, std::span<const uint8_t> second, uint32_t h, uint32_t w);
 
 private:
     struct Block {
