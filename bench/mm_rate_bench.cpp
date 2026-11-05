@@ -34,12 +34,17 @@ int main()
         for (uint64_t i = 0; i < b->length() / 2; ++i)
             h[i] = __fp16(nd(rng));
     }
-    // name, rows a threadgroup (M x NSG for independent, M for cooperative), N, threads
+    // name, rows a threadgroup (M x NSG for independent, M for cooperative), N, threads; the first two repeat at the
+    // end because the first kernel of a run measures 49-65 TFLOP/s (clock ramp), the later ones within 1%.
     for (const auto& [name, m, n, nsg, coop] :
          std::vector<std::tuple<std::string, uint32_t, uint32_t, uint32_t, bool>>{
              {"mm_rate_16x64x128_sg", 16, 64, 4, false},     {"mm_rate_16x128x128_sg", 16, 128, 4, false},
              {"mm_rate_32x64x128_sg", 32, 64, 4, false},     {"mm_rate_64x64x128_coop4", 64, 64, 4, true},
-             {"mm_rate_64x128x128_coop4", 64, 128, 4, true}, {"mm_rate_32x64x128_coop2", 32, 64, 2, true}}) {
+             {"mm_rate_64x128x128_coop4", 64, 128, 4, true}, {"mm_rate_32x64x128_coop2", 32, 64, 2, true},
+             {"mm_rate_bf16_64x128x128_coop4", 64, 128, 4, true}, {"mm_rate_i8_64x128x128_coop4", 64, 128, 4, true},
+             {"mm_rate_i8_64x64x128_coop4", 64, 64, 4, true}, {"mm_rate_bf16_128x128x128_coop8", 128, 128, 8, true},
+             {"mm_rate_f16_128x128x128_coop8", 128, 128, 8, true}, {"mm_rate_i8_128x128x128_coop8", 128, 128, 8, true},
+             {"mm_rate_16x64x128_sg", 16, 64, 4, false}, {"mm_rate_16x128x128_sg", 16, 128, 4, false}}) {
         auto pso = ctx.pipeline(lib.get(), name);
         const uint32_t rows_tg = coop ? m : m * nsg, tgs = groups * 64 / rows_tg;
         const RateArgs a{iters, k_pad};

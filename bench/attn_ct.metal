@@ -2,8 +2,10 @@
 // coop_probe / coop_probe4 print the lane layouts, mm_rate_bench the matmul rates). 56 heads of 128 at 19308 keys,
 // against 336-340 ms for flash_attn_sg_128_16x64_4:
 //   flash_attn_ct: one simdgroup on 16 rows with the softmax on the cooperative tensor, no score buffer: 348-407 ms
-//     (16-row matmul2d tiles reach 49 TFLOP/s against 64 for 32 or 64-row ones; 128 keys a pass spills).
-//   flash_attn_coop: 4 simdgroups on 64 rows, 32 keys a pass: 297-304 ms, the kernel adopted; 64 keys spill (427-485).
+//     (128 keys a pass spills; mm_rate_bench: 16 x 64 matmul2d tiles run at the 60-65 TFLOP/s of 64-row ones once the
+//     clocks are up, 16 x 128 at 39).
+//   flash_attn_coop: 4 simdgroups on 64 rows, 32 keys a pass: 297-304 ms, the kernel adopted (each key and value
+//     row read by two simdgroups instead of four); 64 keys spill (427-485).
 //     _sameblock reads key block 0 every pass: 207 ms, the compute-only time; _noexchange skips the maximum
 //     exchange: 303 ms, so the barriers cost nothing measurable and the K / V streaming a third.
 //   flash_attn_coop_pair: two 32-key products a pass, one exchange per 64 keys: 457 ms.
@@ -255,8 +257,8 @@ template [[host_name("coop_layout_probe_coop2_32x128")]] kernel void coop_layout
 template [[host_name("coop_layout_probe_coop4_64x128")]] kernel void coop_layout_probe_coop<64, 128, 64, 4>(device int*, ushort, ushort);
 
 // Flash attention with the four simdgroups of a threadgroup cooperating on 64 query rows: Q K^T and P V are one
-// cooperative matmul2d each, so they run on 64-row tiles (64 TFLOP/s against 49 for a simdgroup's own 16-row ones)
-// and every key and value row is read by two simdgroups instead of four. A cooperative 64 x N result is a 2 x 2 grid
+// cooperative matmul2d each over 64-row tiles, so every key and value row is read by two simdgroups instead of four.
+// A cooperative 64 x N result is a 2 x 2 grid
 // of 32 x N/2 blocks over the simdgroups (sg >> 1 picks the 16-row sub-block of each 32-row half, sg & 1 the 16-column
 // sub-block of each 32-column quarter); within a block lane l holds the single-simdgroup pattern (rows r0, r0 + 8,
 // r0 + 32, r0 + 40; columns c_base .. c_base + 3 of each 32). A row's scores sit in two simdgroups, so its maximum is
@@ -860,3 +862,39 @@ kernel void flash_attn_coop_tg(device const half* q [[buffer(0)]], device const 
 template [[host_name("xp_flash_attn_coop_tg_128_32")]] kernel void flash_attn_coop_tg<128, 32>(
     device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, ushort,
     ushort);
+
+// The rate test for other element types: bfloat and half against int8 with an int32 accumulator (the hardware's int8
+// rate against BF16's is the question behind int8 GEMMs).
+template <typename T, typename ACC, int M, int N, int Dp, int NSG, bool COOP>
+kernel void mm_rate_t(device const T* q [[buffer(0)]], device const T* k [[buffer(1)]], device ACC* o [[buffer(2)]],
+                      constant RateArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                      ushort sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint64_t qoff = COOP ? uint64_t(tg.x) * M * Dp : (uint64_t(tg.x) * NSG + sg) * M * Dp;
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device T*>(q) + qoff,
+                                                             dextents<int32_t, 2>(Dp, M));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> tk(const_cast<device T*>(k),
+                                                             dextents<int32_t, 2>(Dp, int(a.k_pad)));
+    constexpr auto desc = matmul2d_descriptor(M, N, Dp, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<COOP ? NSG : 1>> op;
+    auto kt0 = tk.slice(0, 0);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(tq), decltype(kt0), ACC>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        acc[i] = ACC(0);
+    for (uint it = 0; it < a.iters; ++it) {
+        auto kt = tk.slice(0, int((it * N) % a.k_pad));
+        op.run(tq, kt, acc);
+    }
+    tensor<device ACC, dextents<int32_t, 2>, tensor_inline> to(o + qoff / Dp * N, dextents<int32_t, 2>(N, M));
+    acc.store(to.slice(0, 0));
+}
+#define MM_RATE_T(T, ACC, m, n, d, nsg, coop, name)                                                                  \
+    template [[host_name(name)]] kernel void mm_rate_t<T, ACC, m, n, d, nsg, coop>(                                  \
+        device const T*, device const T*, device ACC*, constant RateArgs&, uint2, ushort);
+MM_RATE_T(bfloat, float, 64, 128, 128, 4, true, "mm_rate_bf16_64x128x128_coop4")
+MM_RATE_T(int8_t, int32_t, 64, 128, 128, 4, true, "mm_rate_i8_64x128x128_coop4")
+MM_RATE_T(bfloat, float, 128, 128, 128, 8, true, "mm_rate_bf16_128x128x128_coop8")
+MM_RATE_T(half, float, 128, 128, 128, 8, true, "mm_rate_f16_128x128x128_coop8")
+MM_RATE_T(int8_t, int32_t, 128, 128, 128, 8, true, "mm_rate_i8_128x128x128_coop8")
+MM_RATE_T(int8_t, int32_t, 64, 64, 128, 4, true, "mm_rate_i8_64x64x128_coop4")

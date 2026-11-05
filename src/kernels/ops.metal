@@ -214,8 +214,9 @@ FLASH_ATTN_SG(256, 16, 32, 4)
 FLASH_ATTN_SG(64, 16, 32, 4)
 
 // Flash attention with the four simdgroups of a threadgroup cooperating on 64 query rows: Q K^T and P V are one
-// cooperative matmul2d each, so they run on 64-row tiles (64 TFLOP/s against 49 for a simdgroup's own 16-row ones)
-// and every key and value row is read by two simdgroups instead of four. A cooperative 64 x N result is a 2 x 2 grid
+// cooperative matmul2d each over 64-row tiles, so every key and value row is read by two simdgroups instead of four
+// (matmul2d itself runs 16 x 64 and 64 x 64 tiles at the same 60-65 TFLOP/s; 16 x 128 at 39). A cooperative 64 x N
+// result is a 2 x 2 grid
 // of 32 x N/2 blocks over the simdgroups (sg >> 1 picks the 16-row sub-block of each 32-row half, sg & 1 the 16-column
 // sub-block of each 32-column quarter); within a block lane l holds rows r0 = ((l >> 1) & 3) | ((l >> 4) << 2),
 // r0 + 8, r0 + 32, r0 + 40 and, in each 32 columns, the 4 from 4 ((l & 1) + 2 ((l >> 3) & 1)): element i is column
