@@ -207,10 +207,165 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
         device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, \
         ushort);
 FLASH_ATTN_SG(128, 16, 32, 4)
-// 64 keys a pass for 128-wide heads: the same at 4k keys, 12% faster at 19k (384 -> 336 ms for 56 heads).
+// 64 keys a pass: the same at 4k keys, 12% faster at 19k (384 -> 336 ms for 56 heads); the runtime's 64 and 128-wide
+// heads now run flash_attn_coop below (this one is the bench's reference), 256-wide ones flash_attn_sg_256_16x32_4.
 FLASH_ATTN_SG(128, 16, 64, 4)
 FLASH_ATTN_SG(256, 16, 32, 4)
 FLASH_ATTN_SG(64, 16, 32, 4)
+
+// Flash attention with the four simdgroups of a threadgroup cooperating on 64 query rows: Q K^T and P V are one
+// cooperative matmul2d each, so they run on 64-row tiles (64 TFLOP/s against 49 for a simdgroup's own 16-row ones)
+// and every key and value row is read by two simdgroups instead of four. A cooperative 64 x N result is a 2 x 2 grid
+// of 32 x N/2 blocks over the simdgroups (sg >> 1 picks the 16-row sub-block of each 32-row half, sg & 1 the 16-column
+// sub-block of each 32-column quarter); within a block lane l holds rows r0 = ((l >> 1) & 3) | ((l >> 4) << 2),
+// r0 + 8, r0 + 32, r0 + 40 and, in each 32 columns, the 4 from 4 ((l & 1) + 2 ((l >> 3) & 1)): element i is column
+// quarter (i >> 3) % (K / 32), row (i >> 2) & 1 and i / (K / 4) over those, column i & 3. The four lanes of a row in a
+// simdgroup differ in bits 0 and 3, so a row's maximum takes two shuffles; its other half sits in the partner
+// simdgroup (sg ^ 1), exchanged through threadgroup memory once a pass. The scores stay in registers (no score
+// buffer); only P (half) goes through threadgroup memory, double-buffered: two threadgroup barriers a pass. Sums are
+// kept per simdgroup and added at the end. 32 keys a pass (64 spilled). 56 heads of 128 at 19308 keys: 384 ms with
+// flash_attn_sg_128_16x32_4, 336 with 64 keys a pass, 302 here; 4096 x 4122 with 32 heads 7.3 -> 6.6 ms; 32 heads
+// of 64 at 1797 keys 3.0 -> 2.2 ms. The same arguments and grid as flash_attn_sg with 64 queries a threadgroup.
+template <int D, int K>
+kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                            device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
+                            constant AttnArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                            ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]])
+{
+#pragma METAL fp math_mode(relaxed) // INF / NaN are values here
+    constexpr int R = 64, NSG = 4, CAP = R * K / 128, ACAP = R * D / 128;
+    constexpr int CQ = K / 32, AQ = D / 32; // column quarters of the score and output tiles
+    threadgroup half p_all[2][R * K];
+    threadgroup float pmax[2][2][R];
+    threadgroup float lsum[2][R];
+    const uint q0 = tg.x * R, h = tg.y, kvh = h / (a.heads / a.kv_heads);
+    if (q0 >= a.n_q)
+        return;
+    const uint64_t qhead = uint64_t(h) * a.q_pad * D, khead = uint64_t(kvh) * a.k_pad * D;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tq(const_cast<device half*>(q) + qhead + uint64_t(q0) * D,
+                                                                dextents<int32_t, 2>(D, R));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tk(const_cast<device half*>(k) + khead,
+                                                                dextents<int32_t, 2>(D, int(a.k_pad)));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tv(const_cast<device half*>(v) + khead,
+                                                                dextents<int32_t, 2>(D, int(a.k_pad)));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp0(p_all[0], dextents<int32_t, 2>(K, R));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tp1(p_all[1], dextents<int32_t, 2>(K, R));
+    constexpr auto qk_desc = matmul2d_descriptor(R, K, D, false, true, false, matmul2d_descriptor::mode::multiply);
+    constexpr auto pv_desc =
+        matmul2d_descriptor(R, D, K, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroups<NSG>> qk;
+    matmul2d<pv_desc, execution_simdgroups<NSG>> pv;
+    auto kt0 = tk.slice(0, 0);
+    auto sc = qk.template get_destination_cooperative_tensor<decltype(tq), decltype(kt0), float>();
+    auto vt0 = tv.slice(0, 0);
+    auto acc = pv.template get_destination_cooperative_tensor<decltype(tp0), decltype(vt0), float>();
+    for (uint16_t i = 0; i < ACAP; ++i)
+        acc[i] = 0.0f;
+    const uint sgx = sg & 1, sgy = sg >> 1;
+    const uint r0 = ((lane >> 1) & 3) | ((lane >> 4) << 2) | (sgy << 4); // this lane's rows: r0 + {0, 8, 32, 40}
+    const uint c_base = 4 * ((lane & 1) + 2 * ((lane >> 3) & 1)) + 16 * sgx; // within each 32 columns
+    const bool writer = (lane & 9) == 0;                                      // one lane a row for the exchanges
+    const uint last = a.q_pos0 + min(q0 + R, a.n_q) - 1;
+    const uint n_keys = last >= a.block ? a.n_k : min(a.n_k, last + 1);
+    const float scale = a.scale * 1.4426950408889634f;
+    float m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, l[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint buf = 0;
+    for (uint j0 = 0; j0 < n_keys; j0 += K) {
+        for (uint16_t i = 0; i < CAP; ++i)
+            sc[i] = 0.0f;
+        auto kt = tk.slice(0, int(j0));
+        qk.run(tq, kt, sc);
+        // Scaled scores, masked where the pass reaches keys a row may not see; this lane's maxima per row.
+        const bool plain = j0 + K <= a.n_k && ((a.q_pos0 + q0 >= a.block && j0 >= a.block) ||
+                                               j0 + K - 1 <= a.q_pos0 + q0);
+        float mt[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        for (uint16_t i = 0; i < CAP; ++i) {
+            const uint slot = ((i >> 2) & 1) | ((i / (8 * CQ)) << 1);
+            float x = sc[i] * scale;
+            if (!plain) {
+                const uint j = j0 + ((i >> 3) % CQ) * 32 + c_base + (i & 3);
+                const uint pos = a.q_pos0 + q0 + r0 + (slot & 1) * 8 + (slot >> 1) * 32;
+                if (!(j < a.n_k && (j <= pos || (pos >= a.block && j >= a.block))))
+                    x = -INFINITY;
+            }
+            sc[i] = x;
+            mt[slot] = max(mt[slot], x);
+        }
+        for (int s = 0; s < 4; ++s) {
+            mt[s] = max(mt[s], simd_shuffle_xor(mt[s], 1));
+            mt[s] = max(mt[s], simd_shuffle_xor(mt[s], 8));
+        }
+        if (writer)
+            for (int s = 0; s < 4; ++s)
+                pmax[buf][sgx][r0 + (s & 1) * 8 + (s >> 1) * 32] = mt[s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // The reference maximum moves only when a score passes it by 8 (the exponentials stay within 256, half's
+        // range), so most passes leave the output unscaled.
+        bool rescale = false;
+        float f[4];
+        for (int s = 0; s < 4; ++s) {
+            mt[s] = max(mt[s], pmax[buf][sgx ^ 1][r0 + (s & 1) * 8 + (s >> 1) * 32]);
+            f[s] = 1.0f;
+            if (mt[s] > m[s] + 8.0f) {
+                f[s] = m[s] == -INFINITY ? 0.0f : exp2(m[s] - mt[s]);
+                m[s] = mt[s];
+                l[s] *= f[s];
+                rescale = true;
+            }
+        }
+        if (simd_any(rescale))
+            for (uint16_t i = 0; i < ACAP; ++i)
+                acc[i] *= f[((i >> 2) & 1) | ((i / (8 * AQ)) << 1)];
+        threadgroup half* p = p_all[buf];
+        for (uint16_t i = 0; i < CAP; i += 4) {
+            const uint slot = ((i >> 2) & 1) | ((i / (8 * CQ)) << 1);
+            const uint row = r0 + (slot & 1) * 8 + (slot >> 1) * 32, col = ((i >> 3) % CQ) * 32 + c_base;
+            const float mm = m[slot];
+            half4 e;
+            float sum = 0.0f;
+            for (int c = 0; c < 4; ++c) {
+                const float ex = mm == -INFINITY ? 0.0f : exp2(sc[i + c] - mm);
+                e[c] = half(ex);
+                sum += ex;
+            }
+            *reinterpret_cast<threadgroup half4*>(p + row * K + col) = e;
+            l[slot] += sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto vt = tv.slice(0, int(j0));
+        if (buf == 0)
+            pv.run(tp0, vt, acc);
+        else
+            pv.run(tp1, vt, acc);
+        buf ^= 1;
+    }
+    // The rows' sums: this simdgroup's plus the partner's (the four lanes of a row hold the same partial).
+    for (int s = 0; s < 4; ++s) {
+        l[s] += simd_shuffle_xor(l[s], 1);
+        l[s] += simd_shuffle_xor(l[s], 8);
+    }
+    if (writer)
+        for (int s = 0; s < 4; ++s)
+            lsum[sgx][r0 + (s & 1) * 8 + (s >> 1) * 32] = l[s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv[4];
+    for (int s = 0; s < 4; ++s) {
+        const float total = l[s] + lsum[sgx ^ 1][r0 + (s & 1) * 8 + (s >> 1) * 32];
+        inv[s] = total > 0.0f ? 1.0f / total : 0.0f;
+    }
+    for (uint16_t i = 0; i < ACAP; ++i)
+        acc[i] *= inv[((i >> 2) & 1) | ((i / (8 * AQ)) << 1)];
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> to(o + uint64_t(q0) * a.width + h * D,
+                                                                 dextents<int32_t, 2>(int(a.width), int(a.n_q - q0)));
+    auto ot = to.slice(0, 0);
+    acc.store(ot);
+}
+#define FLASH_ATTN_COOP(d, k)                                                                                        \
+    template [[host_name("flash_attn_coop_" #d "_" #k)]] kernel void flash_attn_coop<d, k>(                           \
+        device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, \
+        ushort);
+FLASH_ATTN_COOP(128, 32)
+FLASH_ATTN_COOP(64, 32)
 
 struct HeadsNormArgs {
     uint ld, col0, dim, n_pad, row0, rope; // as HeadsArgs

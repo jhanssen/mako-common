@@ -1,5 +1,5 @@
 # ctest -L cpu: no GPU and no model (what CI runs); -L kernels: the GPU kernels against references.
-mako_add_kernels(common_test_kernels)
+mako_add_kernels(common_test_kernels SOURCES ${PROJECT_SOURCE_DIR}/bench/attn_ct.metal)
 
 add_executable(quant_test quant_test.cpp)
 target_link_libraries(quant_test PRIVATE mako_mtl mako_gguf)

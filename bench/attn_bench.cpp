@@ -1,7 +1,8 @@
 // Flash attention on random half inputs: time and TFLOP/s of each kernel variant, the others compared with the
 // first's output. Defaults: MiniMax-H3's sequence at 960x544 (19308 rows, 56 heads of 128, all bidirectional).
-//   attn_bench [queries] [keys] [heads] [block] [variant...]
-// A variant is NAME:QUERIES_A_THREADGROUP:THREADS (default: the 128-wide kernels with 16 rows a simdgroup).
+//   attn_bench [queries] [keys] [heads] [block] [head dim] [variant...]
+// A variant is NAME:QUERIES_A_THREADGROUP:THREADS (default: flash_attn_sg and flash_attn_coop for the head width;
+// bench/attn_ct.metal's experiments are xp_flash_attn_...).
 #include "mtl/context.hpp"
 #include "mtl/embedded.hpp"
 
@@ -36,8 +37,9 @@ int main(int argc, char** argv)
     const uint32_t n_k = argc > 2 ? std::stoul(argv[2]) : n_q;
     const uint32_t heads = argc > 3 ? std::stoul(argv[3]) : 56;
     const uint32_t block = argc > 4 ? std::stoul(argv[4]) : 0;
+    const uint32_t D = argc > 5 ? std::stoul(argv[5]) : 128;
     std::vector<std::tuple<std::string, uint32_t, uint32_t>> variants;
-    for (int i = 5; i < argc; ++i) {
+    for (int i = 6; i < argc; ++i) {
         const std::string v = argv[i];
         const size_t a = v.find(':'), b = v.find(':', a + 1);
         if (a == std::string::npos || b == std::string::npos) {
@@ -47,8 +49,7 @@ int main(int argc, char** argv)
         variants.emplace_back(v.substr(0, a), std::stoul(v.substr(a + 1, b - a - 1)), std::stoul(v.substr(b + 1)));
     }
     if (variants.empty())
-        variants = {{"flash_attn_sg_128_16x32_4", 64, 128}, {"flash_attn_sg_128_16x64_4", 64, 128}};
-    constexpr uint32_t D = 128;
+        variants = {{std::format("flash_attn_sg_{}_16x32_4", D), 64, 128}, {std::format("flash_attn_coop_{}_32", D), 64, 128}};
     mako::mtl::Context ctx;
     auto lib = ctx.load(mako::mtl::kernels_metallib());
     const uint32_t q_pad = round_up(n_q, 128), k_pad = round_up(n_k, 128);
@@ -112,7 +113,8 @@ int main(int argc, char** argv)
             }
             agree = std::format("rel {:.1e} to the first", std::sqrt(e / r));
         }
-        std::println("{:28} {:8.1f} ms  {:5.1f} TFLOP/s  {}", name, ms, flop / ms / 1e9, agree);
+        std::println("{:28} {:8.1f} ms  {:5.1f} TFLOP/s  {}  (at most {} threads a threadgroup)", name, ms,
+                     flop / ms / 1e9, agree, pso->maxTotalThreadsPerThreadgroup());
     }
     return 0;
 }
