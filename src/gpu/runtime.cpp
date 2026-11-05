@@ -101,6 +101,19 @@ Runtime::Tensor Runtime::upload_raw(int fd, uint64_t offset, uint64_t bytes, ggu
     return d;
 }
 
+Runtime::Tensor Runtime::quantize_i8(const MTL::Buffer* src, uint64_t off, uint32_t cols, uint32_t rows,
+                                     std::vector<uint64_t> dims, bool f32)
+{
+    Tensor t = reserve(mtl::Gemm::i8_bytes(rows, cols), gguf::Type::I8, std::move(dims));
+    MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+    cur_cb_ = cb;
+    MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
+    gemm_->quantize_i8(enc, src, off, rows, cols, 0, t.buf, t.off, !f32);
+    enc->endEncoding();
+    finish(cb);
+    return t;
+}
+
 MTL::Buffer* Runtime::scratch(const std::string& name, uint64_t bytes)
 {
     auto it = scratch_.find(name);
@@ -152,6 +165,16 @@ void Runtime::proj(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffe
                    uint64_t y_off, uint32_t T, uint32_t ldy)
 {
     const uint32_t k = uint32_t(w.dims[0]), n = uint32_t(w.dims[1]);
+    if (mtl::Gemm::i8_input(w.type)) { // the rows quantized to int8 with a scale each, then the int8 GEMM
+        MTL::Buffer* xq = scratch("xq", mtl::Gemm::i8_bytes(T, k));
+        gemm_->quantize_i8(enc, x, x_off, T, k, 0, xq, 0);
+        if (tel_ == Telemetry::kernels)
+            after(enc, "quant_rows_i8");
+        gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, xq, 0, y, y_off, ldy);
+        if (tel_ == Telemetry::kernels)
+            after(enc, std::format("gemm I8 {}x{}", k, n));
+        return;
+    }
     if (mtl::Gemm::bf16_input(w.type)) { // BF16 matrices have only the GEMM
         if (k % 64)
             throw std::runtime_error(std::format("BF16 {}x{}: k must be a multiple of 64", k, n));

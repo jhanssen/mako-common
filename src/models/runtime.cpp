@@ -120,6 +120,24 @@ TransformerRuntime::Tensor TransformerRuntime::upload(const safetensors::Files& 
     return upload_raw(r.file->fd(), r.tensor->offset, r.tensor->bytes, r.tensor->type, r.tensor->dims, name, matrix);
 }
 
+TransformerRuntime::Tensor TransformerRuntime::upload_i8(const safetensors::Files& files, const std::string& name)
+{
+    const auto r = files.find(name);
+    if (!r || r.tensor->dims.size() != 2 ||
+        (r.tensor->type != gguf::Type::BF16 && r.tensor->type != gguf::Type::F16 && r.tensor->type != gguf::Type::F32))
+        throw std::runtime_error(name + ": missing, or not a BF16, F16 or F32 matrix");
+    const uint32_t k = uint32_t(r.tensor->dims[0]), rows = uint32_t(r.tensor->dims[1]);
+    if (r.tensor->type == gguf::Type::BF16) {
+        MTL::Buffer* st = scratch("i8_stage", r.tensor->bytes);
+        gguf::read_exact(r.file->fd(), st->contents(), r.tensor->bytes, r.tensor->offset);
+        return quantize_i8(st, 0, k, rows, r.tensor->dims);
+    }
+    const auto f = read_floats(*r.file, *r.tensor);
+    MTL::Buffer* st = scratch("i8_stage", f.size() * 4);
+    std::memcpy(st->contents(), f.data(), f.size() * 4);
+    return quantize_i8(st, 0, k, rows, r.tensor->dims, true);
+}
+
 TransformerRuntime::Tensor TransformerRuntime::upload_f32(const safetensors::Files& files, const std::string& name)
 {
     const auto f = floats(files, name);

@@ -230,17 +230,18 @@ MM_RATE(64, 128, 128, 4, true, "mm_rate_64x128x128_coop4")
 MM_RATE(32, 64, 128, 2, true, "mm_rate_32x64x128_coop2")
 
 // The same probe for a cooperative product over NSG simdgroups: out[(sg * 32 + lane) * CAP + i] = (valid, col, row).
-template <int R, int N, int D, int NSG>
+// T, ACC: the operands' and the result's element types.
+template <int R, int N, int D, int NSG, typename T = half, typename ACC = float>
 kernel void coop_layout_probe_coop(device int* out [[buffer(0)]], ushort sg [[simdgroup_index_in_threadgroup]],
                                    ushort lane [[thread_index_in_simdgroup]])
 {
-    threadgroup half a[R * D];
-    threadgroup half b[N * D];
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(D, R));
-    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tb(b, dextents<int32_t, 2>(D, N));
+    threadgroup T a[R * D];
+    threadgroup T b[N * D];
+    tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline> ta(a, dextents<int32_t, 2>(D, R));
+    tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline> tb(b, dextents<int32_t, 2>(D, N));
     constexpr auto desc = matmul2d_descriptor(R, N, D, false, true, false, matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<NSG>> op;
-    auto sc = op.template get_destination_cooperative_tensor<decltype(ta), decltype(tb), float>();
+    auto sc = op.template get_destination_cooperative_tensor<decltype(ta), decltype(tb), ACC>();
     const uint cap = sc.get_capacity();
     for (uint16_t i = 0; i < cap; ++i) {
         const auto idx = sc.get_multidimensional_index(i);
@@ -415,6 +416,7 @@ template [[host_name("coop_layout_probe_coop8_128x32")]] kernel void coop_layout
 template [[host_name("coop_layout_probe_coop8_64x64")]] kernel void coop_layout_probe_coop<64, 64, 128, 8>(device int*, ushort, ushort);
 template [[host_name("coop_layout_probe_coop8_64x128")]] kernel void coop_layout_probe_coop<64, 128, 64, 8>(device int*, ushort, ushort);
 template [[host_name("coop_layout_probe_coop8_128x128")]] kernel void coop_layout_probe_coop<128, 128, 32, 8>(device int*, ushort, ushort);
+template [[host_name("coop_layout_probe_i8_coop4_64x128")]] kernel void coop_layout_probe_coop<64, 128, 128, 4, int8_t, int32_t>(device int*, ushort, ushort);
 
 // The cooperative kernel with two 32-key products a pass: one maximum exchange and one P barrier per 64 keys, the
 // scores of 32 keys a cooperative tensor (a 64-key one spilled).

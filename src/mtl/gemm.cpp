@@ -32,6 +32,7 @@ const char* kernel_name(gguf::Type type)
     case gguf::Type::IQ1_M: return "gemm_iq1_m";
     case gguf::Type::F16: return "gemm_f16";
     case gguf::Type::BF16: return "gemm_bf16";
+    case gguf::Type::I8: return "gemm_i8";
     default: return nullptr;
     }
 }
@@ -80,6 +81,19 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
         enc->dispatchThreadgroups(MTL::Size((n + 15) / 16, 1, 1), MTL::Size(128, 1, 1));
         return;
     }
+    if (type == gguf::Type::I8) {
+        if (k % 128 || (ldx && ldx != k))
+            throw std::runtime_error(std::format("int8 GEMM: k={} is not a multiple of 128, or x is strided", k));
+        const bool wide = t > 64 && n % 128 == 0;
+        const uint32_t bm = t <= 32 ? 32 : t <= 64 || wide ? 64 : 128, bn = wide ? 128 : 64;
+        enc->setComputePipelineState(pso(std::format("gemm_i8_{}x{}", bm, bn)));
+        enc->setBuffer(w, w_off, 0);
+        enc->setBuffer(xh, xh_off, 1);
+        enc->setBuffer(y, y_off, 2);
+        enc->setBytes(&a, sizeof(a), 3);
+        enc->dispatchThreadgroups(MTL::Size((n + bn - 1) / bn, (t + bm - 1) / bm, 1), MTL::Size(128, 1, 1));
+        return;
+    }
     if (type == gguf::Type::BF16 || (direct && type == gguf::Type::F16)) {
         if (k % 64)
             throw std::runtime_error(std::format("dense GEMM: k={} is not a multiple of 64", k));
@@ -125,6 +139,19 @@ void Gemm::to_bf16(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64
     enc->setBuffer(xb, xb_off, 1);
     enc->setBytes(a, sizeof(a), 2);
     enc->dispatchThreads(MTL::Size(cols, rows, 1), MTL::Size(256, 1, 1));
+}
+
+void Gemm::quantize_i8(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
+                       uint32_t cols, uint32_t ldx, const MTL::Buffer* q, uint64_t q_off, bool from_bf16)
+{
+    if (cols % 4)
+        throw std::runtime_error(std::format("quantize_i8: {} columns are not a multiple of 4", cols));
+    const uint32_t a[3] = {cols, ldx ? ldx : cols, rows};
+    enc->setComputePipelineState(pso(from_bf16 ? "quant_rows_i8_bf16" : "quant_rows_i8_f32"));
+    enc->setBuffer(x, x_off, 0);
+    enc->setBuffer(q, q_off, 1);
+    enc->setBytes(a, sizeof(a), 2);
+    enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
 }
 
 void Gemm::to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,

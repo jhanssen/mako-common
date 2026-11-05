@@ -46,6 +46,9 @@ protected:
     Tensor upload(const safetensors::Files& files, const std::string& name, bool matrix);
     // A tensor's values as F32 (from F32, F16 or BF16).
     Tensor upload_f32(const safetensors::Files& files, const std::string& name);
+    // A BF16, F16 or F32 matrix as I8: int8 rows with a float scale each (the GEMM at 1.7x BF16's rate, half the
+    // bytes; LoRAs merge into it by requantizing the rows). Stages the file's values in the scratch "i8_stage".
+    Tensor upload_i8(const safetensors::Files& files, const std::string& name);
     // BF16 (or F32, rounded to BF16) matrices of one width, their rows one after another in one tensor; F16 ones
     // stay F16.
     Tensor upload_rows(const safetensors::Files& files, std::span<const std::string> names);

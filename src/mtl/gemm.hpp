@@ -10,7 +10,9 @@ namespace mako::mtl {
 
 // y[t][n] = sum_k W[n][k] * x[t][k] for many tokens (prefill), x in half: weights dequantized to half and multiplied
 // with matmul2d, float accumulation. F32, Q8_0, Q6_K, Q5_K, Q4_K, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and F16 weights; k a
-// multiple of 32. BF16 weights take x in bfloat, both read straight from device memory; k a multiple of 64.
+// multiple of 32. BF16 weights take x in bfloat, both read straight from device memory; k a multiple of 64. I8
+// weights (int8 rows with a float scale each after the rows, quantize_i8()'s layout) take x the same way, the sums
+// exact in int32; k a multiple of 128.
 class Gemm {
 public:
     explicit Gemm(const Context& ctx);
@@ -31,6 +33,12 @@ public:
     void to_bf16(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                  uint32_t ldx, const MTL::Buffer* xb, uint64_t xb_off);
     static bool bf16_input(gguf::Type type) { return type == gguf::Type::BF16; }
+    // q = int8 rows of `cols` of x (float, or bfloat with from_bf16; rows ld elements apart, 0: cols) with a float
+    // scale per row after the rows: i8_bytes(), what I8 weights and their x are made of.
+    void quantize_i8(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
+                     uint32_t cols, uint32_t ldx, const MTL::Buffer* q, uint64_t q_off, bool from_bf16 = false);
+    static bool i8_input(gguf::Type type) { return type == gguf::Type::I8; }
+    static uint64_t i8_bytes(uint64_t rows, uint64_t cols) { return rows * cols + rows * 4; }
 
 private:
     MTL::ComputePipelineState* pso(const std::string& name);

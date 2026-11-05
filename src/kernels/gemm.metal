@@ -295,6 +295,96 @@ template [[host_name("gemm_bf16_64x128")]] kernel void gemm_dense<bfloat, 64, 12
 template [[host_name("gemm_f16d_64x128")]] kernel void gemm_dense<half, 64, 128, 4, 64>(
     device const half*, device const half*, device float*, constant GemmArgs&, uint2);
 
+// Int8 weights [n][k] and activations [t][k], each row with a float scale after all the rows (quant_rows_i8's
+// layout): y[t][n] = s_x[t] s_w[n] sum_k q_x[t][k] q_w[n][k], the sum exact in int32 through matmul2d, which runs
+// int8 at twice the BF16 rate (mm_rate_bench: 128 against 65 TFLOP/s) and reads half the bytes. x dense (ldx = k);
+// k a multiple of KD. A scale per group of 128 along k for the activations (a row's outlier channel then costs only
+// its group the resolution) was tried: the int32 result read out and scaled into float sums every group ran at
+// 13 TFLOP/s on this tile (the sums and each element's row in private memory) and cut MiniMax-H3's velocity error
+// from 7.1e-2 to 5.9e-2 only; a layout-specialized version (4 rows a lane, known slots) would be the way to it.
+template <int TM, int TN, int NSG, int KD>
+kernel void gemm_i8(device const int8_t* w [[buffer(0)]], device const int8_t* x [[buffer(1)]],
+                    device float* y [[buffer(2)]], constant GemmArgs& a [[buffer(3)]],
+                    uint2 tg [[threadgroup_position_in_grid]])
+{
+    const uint n0 = tg.x * TN, t0 = tg.y * TM;
+    device const float* ws = reinterpret_cast<device const float*>(w + uint64_t(a.n) * a.k);
+    device const float* xs = reinterpret_cast<device const float*>(x + uint64_t(a.t) * a.k);
+    tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device int8_t*>(x),
+                                                                  dextents<int32_t, 2>(a.k, a.t));
+    tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> tw(const_cast<device int8_t*>(w),
+                                                                  dextents<int32_t, 2>(a.k, a.n));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, KD, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto mx = tx.slice(0, int(t0));
+    auto mw = tw.slice(0, int(n0));
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(mw), int32_t>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0;
+    for (uint k = 0; k < a.k; k += KD) {
+        auto xk = tx.slice(int(k), int(t0));
+        auto wk = tw.slice(int(k), int(n0));
+        op.run(xk, wk, acc);
+    }
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (!acc.is_valid_element(i))
+            continue;
+        const auto ix = acc.get_multidimensional_index(i);
+        const uint col = n0 + ix[0], row = t0 + ix[1];
+        if (col < a.n && row < a.t)
+            y[uint64_t(row) * a.ldy + col] = float(acc[i]) * xs[row] * ws[col];
+    }
+}
+#define GEMM_I8(tm, tn, nsg, kd)                                                                                     \
+    template [[host_name("gemm_i8_" #tm "x" #tn)]] kernel void gemm_i8<tm, tn, nsg, kd>(                              \
+        device const int8_t*, device const int8_t*, device float*, constant GemmArgs&, uint2);
+GEMM_I8(32, 64, 4, 128)
+GEMM_I8(64, 64, 4, 128)
+GEMM_I8(64, 128, 4, 128)
+GEMM_I8(128, 64, 4, 128)
+template [[host_name("gemm_i8_128x128")]] kernel void gemm_i8<128, 128, 8, 128>(
+    device const int8_t*, device const int8_t*, device float*, constant GemmArgs&, uint2);
+
+// Rows of x (float or bfloat, ldx elements apart) to int8 with a scale each: q[r][c] = rint(x[r][c] / s_r),
+// s_r = max |x[r]| / 127 (an all-zero row: 1 / 127), the scales as floats after the rows at q + rows * cols, which
+// is what gemm_i8 reads. One threadgroup of 256 per row; cols a multiple of 4.
+struct QuantArgs {
+    uint cols, ldx, rows;
+};
+template <typename T>
+kernel void quant_rows_i8(device const T* x [[buffer(0)]], device int8_t* q [[buffer(1)]],
+                          constant QuantArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float part[8];
+    device const vec<T, 4>* xr = reinterpret_cast<device const vec<T, 4>*>(x + uint64_t(row) * a.ldx);
+    const uint n4 = a.cols / 4;
+    float m = 0.0f;
+    for (uint i = tid; i < n4; i += 256) {
+        const float4 v = float4(xr[i]);
+        m = max(m, max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w))));
+    }
+    m = simd_max(m);
+    if ((tid & 31) == 0)
+        part[tid >> 5] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = part[0];
+    for (int i = 1; i < 8; ++i)
+        m = max(m, part[i]);
+    const float s = m > 0.0f ? m / 127.0f : 1.0f / 127.0f, inv = 1.0f / s;
+    device char4* qr = reinterpret_cast<device char4*>(q + uint64_t(row) * a.cols);
+    for (uint i = tid; i < n4; i += 256)
+        qr[i] = char4(clamp(rint(float4(xr[i]) * inv), -127.0f, 127.0f));
+    if (tid == 0)
+        reinterpret_cast<device float*>(q + uint64_t(a.rows) * a.cols)[row] = s;
+}
+template [[host_name("quant_rows_i8_f32")]] kernel void quant_rows_i8<float>(device const float*, device int8_t*,
+                                                                             constant QuantArgs&, uint, uint);
+template [[host_name("quant_rows_i8_bf16")]] kernel void quant_rows_i8<bfloat>(device const bfloat*, device int8_t*,
+                                                                               constant QuantArgs&, uint, uint);
+
 // Few-token GEMM for IQ2_XXS, IQ2_S and IQ3_XXS weights: each weight is read and dequantized once per NT tokens, in
 // registers, and multiplied with every token (the tiled GEMM above dequantizes into threadgroup memory and runs a
 // 32-token tile however few tokens there are). Simdgroups of FR rows, FSG to a threadgroup; lane l takes the 32-weight

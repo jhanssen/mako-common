@@ -170,8 +170,10 @@ uint32_t TransformerRuntime::add_lora(const std::string& path, float scale, std:
         const uint32_t k = uint32_t(tg.w->dims[0]), rank = uint32_t(p.a->dims[1]);
         // A is [rank][k] and B [rows][rank] (row-major), so their contiguous dimensions come first here.
         if (p.a->dims[0] != k || p.b->dims[0] != rank || p.b->dims[1] != tg.rows ||
-            (tg.w->type != gguf::Type::BF16 && tg.w->type != gguf::Type::F16))
+            (tg.w->type != gguf::Type::BF16 && tg.w->type != gguf::Type::F16 && tg.w->type != gguf::Type::I8))
             throw std::runtime_error(std::format("{}: {} does not fit the weight it adapts", path, m));
+        if (tg.w->type == gguf::Type::I8 && k > 16384)
+            throw std::runtime_error(std::format("{}: {} has rows of {}, more than the int8 merge's 16384", path, m, k));
         double a = alpha.value_or(double(rank));
         if (p.alpha)
             a = read_floats(*file, *p.alpha).front();
@@ -190,12 +192,22 @@ uint32_t TransformerRuntime::add_lora(const std::string& path, float scale, std:
         MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
         cur_cb_ = cb;
         MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
-        enc->setComputePipelineState(pso(tg.w->type == gguf::Type::F16 ? "lora_merge_f16" : "lora_merge"));
-        enc->setBuffer(tg.w->buf, tg.w->off + uint64_t(tg.row0) * k * 2, 0);
-        enc->setBuffer(ab, 0, 1);
-        enc->setBuffer(bb, 0, 2);
-        enc->setBytes(&la, sizeof(la), 3);
-        enc->dispatchThreads(MTL::Size(k, tg.rows, 1), MTL::Size(256, 1, 1));
+        if (tg.w->type == gguf::Type::I8) { // a threadgroup per row: the row requantized to its new maximum
+            enc->setComputePipelineState(pso("lora_merge_i8"));
+            enc->setBuffer(tg.w->buf, tg.w->off + uint64_t(tg.row0) * k, 0);
+            enc->setBuffer(ab, 0, 1);
+            enc->setBuffer(bb, 0, 2);
+            enc->setBytes(&la, sizeof(la), 3);
+            enc->setBuffer(tg.w->buf, tg.w->off + uint64_t(tg.w->dims[1]) * k + uint64_t(tg.row0) * 4, 4);
+            enc->dispatchThreadgroups(MTL::Size(tg.rows, 1, 1), MTL::Size(256, 1, 1));
+        } else {
+            enc->setComputePipelineState(pso(tg.w->type == gguf::Type::F16 ? "lora_merge_f16" : "lora_merge"));
+            enc->setBuffer(tg.w->buf, tg.w->off + uint64_t(tg.row0) * k * 2, 0);
+            enc->setBuffer(ab, 0, 1);
+            enc->setBuffer(bb, 0, 2);
+            enc->setBytes(&la, sizeof(la), 3);
+            enc->dispatchThreads(MTL::Size(k, tg.rows, 1), MTL::Size(256, 1, 1));
+        }
         enc->endEncoding();
         finish(cb);
         ++done;

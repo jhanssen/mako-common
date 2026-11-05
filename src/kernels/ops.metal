@@ -641,6 +641,41 @@ template [[host_name("lora_merge")]] kernel void lora_merge<bfloat>(device bfloa
 template [[host_name("lora_merge_f16")]] kernel void lora_merge<half>(device half*, device const float*,
                                                                       device const float*, constant LoraArgs&, uint2);
 
+// The same over int8 rows with a float scale each (gemm_i8's weights, sc[r] the scale of row r): the row's values
+// s_r q + scale B A are requantized to the new row maximum. One threadgroup of 256 per adapted row, each thread's
+// values in registers: k at most 16384.
+kernel void lora_merge_i8(device int8_t* w [[buffer(0)]], device const float* a [[buffer(1)]],
+                          device const float* b [[buffer(2)]], constant LoraArgs& p [[buffer(3)]],
+                          device float* sc [[buffer(4)]], uint r [[threadgroup_position_in_grid]],
+                          uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float part[8];
+    const uint br = (r + p.b_rot) % p.rows;
+    device int8_t* wr = w + uint64_t(r) * p.k;
+    const float s = sc[r];
+    float v[64];
+    float m = 0.0f;
+    for (uint j = 0, c = tid; c < p.k; ++j, c += 256) {
+        float d = 0.0f;
+        for (uint q = 0; q < p.rank; ++q)
+            d += b[uint64_t(br) * p.rank + q] * a[uint64_t(q) * p.k + c];
+        v[j] = s * float(wr[c]) + p.scale * d;
+        m = max(m, abs(v[j]));
+    }
+    m = simd_max(m);
+    if ((tid & 31) == 0)
+        part[tid >> 5] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = part[0];
+    for (int i = 1; i < 8; ++i)
+        m = max(m, part[i]);
+    const float ns = m > 0.0f ? m / 127.0f : 1.0f / 127.0f, inv = 1.0f / ns;
+    for (uint j = 0, c = tid; c < p.k; ++j, c += 256)
+        wr[c] = int8_t(clamp(rint(v[j] * inv), -127.0f, 127.0f));
+    if (tid == 0)
+        sc[r] = ns;
+}
+
 struct LnAffineArgs {
     uint n;
     float eps;
