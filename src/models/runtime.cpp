@@ -274,7 +274,7 @@ void TransformerRuntime::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer
 
 namespace {
 struct CubeArgs {
-    uint32_t n_cubes, k_pad, dim, topk;
+    uint32_t n_cubes, k_pad, dim, topk, local, stride;
 };
 struct SparseAttnArgs {
     uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, width;
@@ -285,11 +285,12 @@ struct SparseAttnArgs {
 
 void TransformerRuntime::cube_select(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, uint32_t heads,
                                      uint32_t q_pad, uint32_t k_pad, uint32_t n_cubes, MTL::Buffer* cnt, uint32_t topk,
-                                     MTL::Buffer*& sel, MTL::Buffer*& nsel)
+                                     MTL::Buffer*& sel, MTL::Buffer*& nsel, uint32_t local, uint32_t stride)
 {
-    if (n_cubes > 4096 || !topk)
-        throw std::runtime_error(std::format("cube_select: {} cubes, top {}", n_cubes, topk));
-    const CubeArgs a{n_cubes, k_pad, kHeadDim, std::min(topk, n_cubes)}, aq{n_cubes, q_pad, kHeadDim, a.topk};
+    if (n_cubes > 4096 || !topk || (local != 0 && local != 1 && local != 3))
+        throw std::runtime_error(std::format("cube_select: {} cubes, top {}, local {}", n_cubes, topk, local));
+    const CubeArgs a{n_cubes, k_pad, kHeadDim, std::min(topk, n_cubes), local, stride},
+        aq{n_cubes, q_pad, kHeadDim, a.topk, local, stride};
     MTL::Buffer* qp = scratch("c_qp", uint64_t(heads) * n_cubes * kHeadDim * 4);
     MTL::Buffer* kp = scratch("c_kp", uint64_t(heads) * n_cubes * kHeadDim * 4);
     MTL::Buffer* sc = scratch("c_sc", uint64_t(heads) * n_cubes * n_cubes * 4);

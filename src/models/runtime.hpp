@@ -100,9 +100,11 @@ protected:
     // cubes and the dense rows, the dense rows' queries to everything, and writes query row r's output to o row
     // map[r] (map[r] < 0: dropped). q, k, v as attention() takes them (q_pad a multiple of 64, k_pad of 128; the
     // strides of a head's rows in q and in k / v).
+    // local: 0 by score alone, 1 the query cube itself always first, 3 also its neighbours `stride` cubes before and
+    // after (the frame groups adjacent in time), the rest by score.
     void cube_select(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, uint32_t heads, uint32_t q_pad,
                      uint32_t k_pad, uint32_t n_cubes, MTL::Buffer* cnt, uint32_t topk, MTL::Buffer*& sel,
-                     MTL::Buffer*& nsel);
+                     MTL::Buffer*& nsel, uint32_t local = 0, uint32_t stride = 0);
     void attention_sparse(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v,
                           MTL::Buffer* o, uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad, uint32_t heads,
                           uint32_t kv_heads, uint32_t width, uint32_t n_cubes, uint32_t topk, uint32_t dense0,

@@ -893,6 +893,8 @@ kernel void gelu_erf(device float* x [[buffer(0)]], constant uint& n [[buffer(1)
 struct CubeArgs {
     uint n_cubes, k_pad, dim; // cubes of 64 rows; rows of a head in the tiles pooled (q's and k's can differ); the width
     uint topk;                // cube_topk: cubes kept per query cube
+    uint local;               // cube_topk: 1 keeps the query cube itself first, 3 also the cubes `stride` before and after
+    uint stride;              // cubes a frame group apart (the temporal neighbours)
 };
 
 // out[h][c][d] = mean over the cube's valid rows of x[h][c * 64 + r][d] (cnt[c] valid rows). Grid (dim, cubes, heads).
@@ -942,7 +944,24 @@ kernel void cube_topk(device const float* sc [[buffer(0)]], device ushort* sel [
         scores[i] = row[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint k = min(a.topk, n);
-    for (uint it = 0; it < k; ++it) {
+    // The local cubes go in first, their scores taken out of the running.
+    uint it = 0;
+    if (a.local) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            const uint picks[3] = {qc, qc >= a.stride ? qc - a.stride : n, qc + a.stride < n ? qc + a.stride : n};
+            for (uint j = 0; j < a.local && it < k; ++j)
+                if (picks[j] < n) {
+                    sel[(uint64_t(h) * n + qc) * a.topk + it++] = ushort(picks[j]);
+                    scores[picks[j]] = -INFINITY;
+                }
+            best_i[0] = it;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        it = best_i[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (; it < k; ++it) {
         float v = -INFINITY;
         uint idx = 0;
         for (uint i = tid; i < n; i += 256)
@@ -1055,6 +1074,7 @@ kernel void flash_attn_sparse_128(device const half* q [[buffer(0)]], device con
             sc[i] = 0.0f;
         auto kt = tk.slice(0, int(j0));
         qk.run(tq, kt, sc);
+        // Every pass masked by range and validity (a flag for all-valid passes that skipped this measured no faster).
         float mt[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
         for (uint16_t i = 0; i < CAP; ++i) {
             const uint slot = ((i >> 2) & 1) | ((i / (8 * CQ)) << 1);

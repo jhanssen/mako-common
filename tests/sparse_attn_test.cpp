@@ -180,6 +180,32 @@ int main()
         }
     check(worst < 5e-3, std::format("attention_sparse: worst row rel error {:.2e}", worst));
     check(untouched_bad == 0, std::format("padding and out-of-range rows left alone ({} values written)", untouched_bad));
+    // The local option: the query cube and its neighbours (stride 1) lead the selection, the rest by score.
+    {
+        MTL::CommandBuffer* cb = h.ctx_.queue()->commandBuffer();
+        h.cur_cb_ = cb;
+        MTL::ComputeCommandEncoder* enc = h.encoder(cb, 0, -1);
+        h.cube_select(enc, qb, kb, heads, q_pad, k_pad, cubes, cntb, 4, sel, nsel, 3, 1);
+        enc->endEncoding();
+        h.finish(cb);
+        const auto* s4 = static_cast<const uint16_t*>(sel->contents());
+        uint32_t bad = 0;
+        for (uint32_t hh = 0; hh < heads; ++hh)
+            for (uint32_t qc = 0; qc < cubes; ++qc) {
+                const uint16_t* e = s4 + (uint64_t(hh) * cubes + qc) * 4;
+                std::vector<uint32_t> want{qc};
+                if (qc >= 1)
+                    want.push_back(qc - 1);
+                if (qc + 1 < cubes)
+                    want.push_back(qc + 1);
+                for (size_t i = 0; i < want.size(); ++i)
+                    bad += e[i] != want[i];
+                for (uint32_t i = 0; i < 4; ++i) // no cube twice
+                    for (uint32_t j = i + 1; j < 4; ++j)
+                        bad += e[i] == e[j];
+            }
+        check(bad == 0, std::format("cube_select with local cubes: {} entries off", bad));
+    }
     std::println("{}", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
 }
