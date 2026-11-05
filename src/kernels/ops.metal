@@ -735,3 +735,147 @@ kernel void scale_add(device float* x [[buffer(0)]], device const float* y [[buf
     if (gid.x < n)
         x[uint64_t(gid.y) * n + gid.x] += g[gid.x] * y[uint64_t(gid.y) * n + gid.x];
 }
+
+// Convolutions as GEMMs over channels-last images: the 3x3 unfold (stride 1 and 2), the group norm, GELU.
+
+// Padding of the convolutions' unfold: 0 zeros, 1 the image reflected without its edge (PyTorch's reflect).
+static int pad_coord(int i, int n, uint mode)
+{
+    if (mode == 1)
+        return i < 0 ? -i : i >= n ? 2 * n - 2 - i : i;
+    return i;
+}
+
+struct Im2colArgs {
+    uint h, w, c;   // input image
+    uint p0, rows;  // output pixels [p0, p0 + rows)
+    uint kpad;      // columns, 9 * c padded to a multiple of 32
+    uint mode;      // the padding's: 0 zeros, 1 reflect
+};
+
+// out[r][ch * 9 + ky * 3 + kx] = x[y + ky - 1][x + kx - 1][ch] for output pixel p0 + r = (y, x), zero outside the
+// image and past 9 * c. Grid (kpad, rows).
+kernel void im2col3x3(device const float* x [[buffer(0)]], device half* out [[buffer(1)]],
+                      constant Im2colArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x, r = gid.y;
+    if (col >= a.kpad || r >= a.rows)
+        return;
+    float v = 0.0f;
+    if (col < 9 * a.c) {
+        const uint ch = col / 9, kk = col % 9, p = a.p0 + r;
+        const int y = pad_coord(int(p / a.w) + int(kk / 3) - 1, int(a.h), a.mode);
+        const int xx = pad_coord(int(p % a.w) + int(kk % 3) - 1, int(a.w), a.mode);
+        if (y >= 0 && y < int(a.h) && xx >= 0 && xx < int(a.w))
+            v = x[(uint64_t(y) * a.w + uint(xx)) * a.c + ch];
+    }
+    out[uint64_t(r) * a.kpad + col] = half(v);
+}
+
+// im2col3x3 for a stride-2 convolution (padding 1): output pixel p0 + r = (y, x) of an ow-wide image reads input
+// pixels (2y + ky - 1, 2x + kx - 1) of the h x w input. Grid (kpad, rows).
+struct Im2colS2Args {
+    uint h, w, c, p0, rows, kpad, ow;
+    uint pad;  // above and left of the image: 1, or 0 (then only below and right)
+    uint mode; // the padding's: 0 zeros, 1 reflect
+};
+kernel void im2col3x3_s2(device const float* x [[buffer(0)]], device half* out [[buffer(1)]],
+                         constant Im2colS2Args& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint col = gid.x, r = gid.y;
+    if (col >= a.kpad || r >= a.rows)
+        return;
+    float v = 0.0f;
+    if (col < 9 * a.c) {
+        const uint ch = col / 9, kk = col % 9, p = a.p0 + r;
+        const int y = pad_coord(int(p / a.ow) * 2 + int(kk / 3) - int(a.pad), int(a.h), a.mode);
+        const int xx = pad_coord(int(p % a.ow) * 2 + int(kk % 3) - int(a.pad), int(a.w), a.mode);
+        if (y >= 0 && y < int(a.h) && xx >= 0 && xx < int(a.w))
+            v = x[(uint64_t(y) * a.w + uint(xx)) * a.c + ch];
+    }
+    out[uint64_t(r) * a.kpad + col] = half(v);
+}
+
+
+// Group norm over channels-last images [rows][c]: per-chunk channel sums, then per-group statistics, then the norm.
+
+struct GnArgs {
+    uint rows, c, groups, chunk; // chunk: rows a threadgroup of gn_partial sums
+    float eps;
+    uint silu;
+};
+
+// part[k][ch] = (sum, sum of squares) of channel ch over rows [k * chunk, (k + 1) * chunk). Grid (c, chunks).
+kernel void gn_partial(device const float* x [[buffer(0)]], device float2* part [[buffer(1)]],
+                       constant GnArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint ch = gid.x, k = gid.y;
+    if (ch >= a.c)
+        return;
+    const uint r1 = min(a.rows, (k + 1) * a.chunk);
+    float s = 0.0f, q = 0.0f;
+    for (uint r = k * a.chunk; r < r1; ++r) {
+        const float v = x[uint64_t(r) * a.c + ch];
+        s += v;
+        q += v * v;
+    }
+    part[uint64_t(k) * a.c + ch] = float2(s, q);
+}
+
+// stats[g] = (mean, 1 / sqrt(var + eps)) of group g from the chunks' sums. One thread per group.
+kernel void gn_stats(device const float2* part [[buffer(0)]], device float2* stats [[buffer(1)]],
+                     constant GnArgs& a [[buffer(2)]], uint g [[thread_position_in_grid]])
+{
+    if (g >= a.groups)
+        return;
+    const uint per = a.c / a.groups, chunks = (a.rows + a.chunk - 1) / a.chunk;
+    float s = 0.0f, q = 0.0f;
+    for (uint k = 0; k < chunks; ++k)
+        for (uint ch = g * per; ch < (g + 1) * per; ++ch) {
+            const float2 p = part[uint64_t(k) * a.c + ch];
+            s += p.x;
+            q += p.y;
+        }
+    const float n = float(a.rows) * float(per), mean = s / n;
+    stats[g] = float2(mean, rsqrt(max(q / n - mean * mean, 0.0f) + a.eps));
+}
+
+// y = (x - mean) / sd * w + b per group, then SiLU when silu is set. Grid (c, rows).
+kernel void gn_apply(device const float* x [[buffer(0)]], device const float2* stats [[buffer(1)]],
+                     device const float* w [[buffer(2)]], device const float* b [[buffer(3)]],
+                     device float* y [[buffer(4)]], constant GnArgs& a [[buffer(5)]],
+                     uint2 gid [[thread_position_in_grid]])
+{
+    const uint ch = gid.x;
+    if (ch >= a.c || gid.y >= a.rows)
+        return;
+    const float2 st = stats[ch / (a.c / a.groups)];
+    const uint64_t i = uint64_t(gid.y) * a.c + ch;
+    float v = (x[i] - st.x) * st.y * w[ch] + b[ch];
+    if (a.silu)
+        v = v / (1.0f + exp(-v));
+    y[i] = v;
+}
+
+
+// erf, max error ~1.2e-7 (Chebyshev fit of erfc).
+static float erf_fit(float x)
+{
+    const float z = fabs(x), t = 1.0f / (1.0f + 0.5f * z);
+    const float r =
+        t * exp(-z * z - 1.26551223f +
+                t * (1.00002368f +
+                     t * (0.37409196f +
+                          t * (0.09678418f +
+                               t * (-0.18628806f +
+                                    t * (0.27886807f +
+                                         t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
+    return x >= 0.0f ? 1.0f - r : r - 1.0f;
+}
+
+// x = x / 2 * (1 + erf(x / sqrt 2)).
+kernel void gelu_erf(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]])
+{
+    if (i < n)
+        x[i] = 0.5f * x[i] * (1.0f + erf_fit(x[i] * 0.70710678f));
+}
