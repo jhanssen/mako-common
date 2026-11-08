@@ -185,17 +185,18 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
         kern.smem = ti->smem;
         kern.rows_per_sg_grid = ti->rows_per_sg_grid;
     }
-    // mako's IQ2_XXS / IQ3_XXS kernels, faster (grid tables as half): IQ2_XXS gives the per-format kernel's results bit
-    // for bit, IQ3_XXS rounds differently (~1e-7 relative).
+    // mako's IQ2_XXS / IQ3_XXS / IQ2_S kernels, faster (grid tables as half in constant memory): IQ2_XXS gives the
+    // per-format kernel's results bit for bit, IQ3_XXS rounds differently (~1e-7 relative).
     // mako's IQ1_S / IQ1_M kernels: the same sums, vectorized.
     const bool own_iq = own_kernels_ && tokens == 0 &&
-                        (type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ3_XXS || type == gguf::Type::IQ1_S ||
-                         type == gguf::Type::IQ1_M);
+                        (type == gguf::Type::IQ2_XXS || type == gguf::Type::IQ3_XXS || type == gguf::Type::IQ2_S ||
+                         type == gguf::Type::IQ1_S || type == gguf::Type::IQ1_M);
     if (own_iq) {
         kern.nr0 = 4;
         switch (type) {
-        case gguf::Type::IQ2_XXS: name = "mako_mul_mv_iq2_xxs_f32_r4", kern.smem = 256 * 16 + 128; break;
-        case gguf::Type::IQ3_XXS: name = "mako_mul_mv_iq3_xxs_f32_r4", kern.smem = 256 * 8 + 128; break;
+        case gguf::Type::IQ2_XXS: name = "mako_mul_mv_iq2_xxs_f32_r4", kern.smem = 0; break;
+        case gguf::Type::IQ3_XXS: name = "mako_mul_mv_iq3_xxs_f32_r4", kern.smem = 0; break;
+        case gguf::Type::IQ2_S: name = "mako_mul_mv_iq2_s_f32_r4", kern.smem = 0; break;
         case gguf::Type::IQ1_S: name = "mako_mul_mv_iq1_s_f32_r4", kern.smem = 0; break;
         default: name = "mako_mul_mv_iq1_m_f32_r4", kern.smem = 0; break;
         }
@@ -407,7 +408,7 @@ void Gemv::encode_jobs(MTL::ComputeCommandEncoder* enc, std::span<const Job> job
     enc->setComputePipelineState(jobs_pso_.get());
     enc->setBuffer(table, table_off, 0);
     enc->setBytes(&n, sizeof(n), 1);
-    enc->setThreadgroupMemoryLength(256 * 16 + 128, 0);
+    enc->setThreadgroupMemoryLength(512 * 8 + 128, 0); // the IQ2_XS job's tables, the largest
     enc->dispatchThreadgroups(MTL::Size(tg, T, 1), MTL::Size(32, 4, 1));
 }
 

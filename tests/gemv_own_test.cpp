@@ -28,7 +28,8 @@ int main()
     };
     for (const Case c : {Case{Type::IQ2_XXS, 5120, 2304, true}, Case{Type::IQ2_XXS, 4096, 1000, true},
                          Case{Type::IQ2_XXS, 2048, 4096, true}, Case{Type::IQ3_XXS, 2304, 5120, false},
-                         Case{Type::IQ3_XXS, 2048, 4096, false}, Case{Type::IQ1_M, 5120, 2304, false},
+                         Case{Type::IQ3_XXS, 2048, 4096, false}, Case{Type::IQ2_S, 2048, 4096, true},
+                         Case{Type::IQ2_S, 2304, 5120, true}, Case{Type::IQ1_M, 5120, 2304, false},
                          Case{Type::IQ1_M, 2304, 5120, false}, Case{Type::IQ1_S, 5120, 2304, false},
                          Case{Type::IQ1_S, 2304, 5120, false}}) {
         const uint32_t batch = 6, n_expert = 16;
