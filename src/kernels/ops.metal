@@ -406,3 +406,13 @@ kernel void copy_f32(device const float* x [[buffer(0)]], device float* y [[buff
     if (i < n)
         y[i] = x[i];
 }
+
+// The idle keepalive (gpu::Runtime): reads one word per `stride` words of a buffer, n of them, so the GPU keeps its
+// mappings of the buffer; the value is never equal, so nothing is written.
+kernel void keepalive_touch(device const uint* buf [[buffer(0)]], device atomic_uint* sink [[buffer(1)]],
+                            constant uint& stride [[buffer(2)]], constant uint& n [[buffer(3)]],
+                            uint i [[thread_position_in_grid]])
+{
+    if (i < n && buf[uint64_t(i) * stride] == 0x9e3779b9u)
+        atomic_fetch_add_explicit(sink, 1u, memory_order_relaxed);
+}

@@ -57,9 +57,91 @@ Runtime::Runtime(mtl::Context& ctx, Telemetry telemetry) : ctx_(ctx), tel_(telem
         repeat_label_ = spec.substr(0, colon);
         repeat_n_ = std::max(0, std::atoi(r + colon + 1));
     }
+    if (const char* c = std::getenv("MAKO_THREADGROUP_CAP"))
+        tg_cap_ = uint32_t(std::max(0, std::atoi(c)));
     gemv_ = std::make_unique<mtl::Gemv>(ctx_);
     gemm_ = std::make_unique<mtl::Gemm>(ctx_);
     lib_ = ctx_.load(mtl::kernels_metallib());
+}
+
+Runtime::~Runtime()
+{
+    set_keepalive(false);
+}
+
+void Runtime::set_keepalive(bool on, std::chrono::milliseconds period, uint32_t stride)
+{
+    if (keepalive_thread_.joinable()) {
+        keepalive_thread_.request_stop();
+        keepalive_thread_.join();
+    }
+    if (!on)
+        return;
+    keepalive_period_ = period;
+    keepalive_stride_ = std::max<uint32_t>(stride, 4);
+    if (!keepalive_sink_)
+        keepalive_sink_ = mtl::Ref<MTL::Buffer>(ctx_.device()->newBuffer(64, MTL::ResourceStorageModeShared));
+    keepalive_pso_ = pso("keepalive_touch");
+    note_commit();
+    keepalive_thread_ = std::jthread([this](std::stop_token st) { keepalive_loop(st); });
+}
+
+void Runtime::keepalive_buffers(std::vector<MTL::Buffer*> bufs)
+{
+    std::lock_guard lock(keepalive_m_);
+    keepalive_bufs_ = std::move(bufs);
+}
+
+void Runtime::keepalive_loop(std::stop_token st)
+{
+    MTL::ComputePipelineState* p = keepalive_pso_;
+    while (!st.stop_requested()) {
+        for (int i = 0; i < 10 && !st.stop_requested(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto since = Clock::now().time_since_epoch().count() - last_commit_ns_.load();
+        if (std::chrono::nanoseconds(since) < keepalive_period_)
+            continue;
+        NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
+        MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(p);
+        enc->setBuffer(keepalive_sink_.get(), 0, 1);
+        const uint32_t stride = keepalive_stride_ / 4;
+        {
+            std::lock_guard lock(keepalive_m_);
+            if (keepalive_bufs_.empty()) {
+                const uint32_t one = 1, zero = 0;
+                enc->setBuffer(keepalive_sink_.get(), 0, 0);
+                enc->setBytes(&zero, 4, 2);
+                enc->setBytes(&one, 4, 3);
+                enc->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+            }
+            for (MTL::Buffer* b : keepalive_bufs_) {
+                const uint32_t n = uint32_t(b->length() / keepalive_stride_);
+                if (!n)
+                    continue;
+                enc->setBuffer(b, 0, 0);
+                enc->setBytes(&stride, 4, 2);
+                enc->setBytes(&n, 4, 3);
+                enc->dispatchThreads(MTL::Size(n, 1, 1), MTL::Size(256, 1, 1));
+            }
+        }
+        enc->endEncoding();
+        cb->commit();
+        note_commit();
+        pool->release();
+    }
+}
+
+void Runtime::check_fit(MTL::ComputePipelineState* p, MTL::Size tg, std::string_view fn) const
+{
+    const uint64_t threads = tg.width * tg.height * tg.depth;
+    uint64_t limit = p->maxTotalThreadsPerThreadgroup();
+    if (tg_cap_)
+        limit = std::min<uint64_t>(limit, tg_cap_);
+    if (threads > limit)
+        throw std::runtime_error(std::format("{}: a threadgroup of {} threads, the pipeline allows {} on this GPU",
+                                             fn, threads, limit));
 }
 
 Runtime::Tensor Runtime::reserve(uint64_t bytes, gguf::Type type, std::vector<uint64_t> dims)
@@ -217,7 +299,9 @@ MTL::Buffer* Runtime::halves(MTL::ComputeCommandEncoder* enc, MTL::Buffer* x, ui
 void Runtime::dispatch(MTL::ComputeCommandEncoder*& enc, const std::string& fn, std::initializer_list<MTL::Buffer*> bufs,
                        const void* args, size_t args_size, MTL::Size grid, MTL::Size tg, bool threads)
 {
-    enc->setComputePipelineState(pso(fn));
+    MTL::ComputePipelineState* p = pso(fn);
+    check_fit(p, tg, fn);
+    enc->setComputePipelineState(p);
     NS::UInteger i = 0;
     for (MTL::Buffer* b : bufs)
         enc->setBuffer(b, 0, i++);
@@ -432,8 +516,9 @@ void Runtime::finish(MTL::CommandBuffer* cb)
         encoding_ = false;
     }
     cb->commit();
+    note_commit();
     on_committed(cb);
-    cb->waitUntilCompleted();
+    wait(cb);
     on_completed();
     stats_.gpu_wait_ms += ms_since(t0);
     ahead_.push_back(cb);
@@ -448,6 +533,20 @@ void Runtime::finish(MTL::CommandBuffer* cb)
     deliver_probes();
 }
 
+// The spin covers a decode step of any width; a prefill group's command buffer, which runs for seconds, blocks after
+// it.
+void Runtime::wait(MTL::CommandBuffer* cb) const
+{
+    constexpr double kSpinMs = 250;
+    if (spin_wait_) {
+        const auto t0 = Clock::now();
+        while (cb->status() < MTL::CommandBufferStatusCompleted && ms_since(t0) < kSpinMs)
+            asm volatile("yield" ::: "memory");
+    }
+    if (cb->status() < MTL::CommandBufferStatusCompleted)
+        cb->waitUntilCompleted();
+}
+
 void Runtime::commit_ahead(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc)
 {
     if (!commit_ahead_ok())
@@ -458,6 +557,7 @@ void Runtime::commit_ahead(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*&
         encoding_ = false;
     }
     cb->commit();
+    note_commit();
     ahead_.push_back(cb);
     cb = ctx_.queue()->commandBuffer();
     cur_cb_ = cb;

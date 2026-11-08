@@ -5,15 +5,18 @@
 #include "mtl/gemm.hpp"
 #include "mtl/gemv.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace mako::gpu {
@@ -52,6 +55,19 @@ public:
     };
     const Stats& stats() const { return stats_; }
 
+    // Whether finish() spins on the command buffer's status before blocking in waitUntilCompleted (default on):
+    // the blocking wait's thread wake costs ~0.5 ms a wait, a step's whole CPU gap; the spin holds a core for the
+    // GPU time of a step (at most kSpinMs) instead.
+    void set_spin_wait(bool on) { spin_wait_ = on; }
+
+    // While nothing has been committed for `period`, a small kernel is committed on the queue that often: after a
+    // few seconds idle the first work pays the driver's cost of mapping the weights again (~350 ms measured). With
+    // buffers given (keepalive_buffers), the kernel reads one word per `stride` bytes of each; without, it runs
+    // empty. Off by default (a server turns it on); a derived class turns it off before the buffers it gave go.
+    void set_keepalive(bool on, std::chrono::milliseconds period = std::chrono::milliseconds(1000),
+                       uint32_t stride = 1 << 20);
+    void keepalive_buffers(std::vector<MTL::Buffer*> bufs);
+
     // Bytes of all scratch buffers allocated so far.
     uint64_t scratch_bytes() const
     {
@@ -63,7 +79,7 @@ public:
 
 protected:
     Runtime(mtl::Context& ctx, Telemetry telemetry);
-    virtual ~Runtime() = default;
+    virtual ~Runtime();
     Runtime(const Runtime&) = delete;
     Runtime& operator=(const Runtime&) = delete;
 
@@ -76,6 +92,10 @@ protected:
 
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
     MTL::ComputePipelineState* pso(const std::string& fn);
+    // Throws when `tg` has more threads than pipeline `fn` can run in one threadgroup: Metal skips such a dispatch
+    // without an error, leaving its outputs stale. dispatch() checks; direct dispatches above 256 threads call it.
+    // MAKO_THREADGROUP_CAP=N lowers every pipeline's limit to N (a test hook).
+    void check_fit(MTL::ComputePipelineState* p, MTL::Size tg, std::string_view fn) const;
 
     // proj() of at least this many tokens uses the GEMM (fewer: the GEMV, which reads each weight once for them and
     // gives every token the same result as alone).
@@ -83,6 +103,19 @@ protected:
     // BF16 matrices also multiply what rounding the activations to bfloat left out (a second GEMM): about 16 bits of
     // the activations instead of 8, for values that cancel later (a text encoder's outlier channels).
     bool bf16_split_ = false;
+    bool spin_wait_ = true;
+    uint32_t tg_cap_ = 0; // MAKO_THREADGROUP_CAP; 0: none
+    // The keepalive: the thread, what it reads, and when the queue was last given work (finish, commit_ahead).
+    void keepalive_loop(std::stop_token st);
+    void note_commit() { last_commit_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count()); }
+    std::jthread keepalive_thread_;
+    std::mutex keepalive_m_;
+    std::vector<MTL::Buffer*> keepalive_bufs_;
+    mtl::Ref<MTL::Buffer> keepalive_sink_;
+    MTL::ComputePipelineState* keepalive_pso_ = nullptr; // made on the caller's thread (psos_ is not shared)
+    std::chrono::milliseconds keepalive_period_{1000};
+    uint32_t keepalive_stride_ = 1 << 20;
+    std::atomic<int64_t> last_commit_ns_{0};
     // batch > 1: that many matrices from w on, each its own y block of t rows; x_shared: all read the same x.
     void gemv(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffer* x, uint64_t x_off, MTL::Buffer* y,
               uint64_t y_off, uint32_t batch = 1, uint32_t t = 1, bool x_shared = false);
@@ -116,6 +149,8 @@ protected:
     void after(MTL::ComputeCommandEncoder*& enc, std::string_view kernel);
     // Commits cb, waits for it (on_committed() runs in between) and accounts for it and the ones committed ahead.
     void finish(MTL::CommandBuffer* cb);
+    // Waits for a committed command buffer: spinning on its status (set_spin_wait), else blocking.
+    void wait(MTL::CommandBuffer* cb) const;
     void submit(MTL::CommandBuffer*& cb, MTL::ComputeCommandEncoder*& enc);
     // Commits what cb holds, so the GPU starts on it while the rest of the step is encoded into a new command
     // buffer (finish() accounts for both). Not while commit_ahead_ok() says no.
