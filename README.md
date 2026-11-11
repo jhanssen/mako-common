@@ -6,7 +6,7 @@ The code [mako](https://github.com/jhanssen/mako) (LLM inference) and
 
 - `gguf`, `quant`, `safetensors`: model files and quantized formats
 - `mtl`, `gpu`: Metal context, GEMV and GEMM, the kernel runtime; `src/kernels` the kernels every program has
-- `models`: what the transformer models share (weights from safetensors, attention, LoRAs) and the Qwen text encoders
+- `models`: what the transformer models share (weights from safetensors, attention, LoRAs), the Qwen text encoders, and MiniMax-H3's transformer and VAE (the video and image models')
 - `text`: the BPE and unigram tokenizers
 - `app`: command-line options and presets; `log`: timestamped logging
 - `http`: API keys and loopback checks for the HTTP servers
