@@ -205,8 +205,11 @@ void Runtime::proj(MTL::ComputeCommandEncoder*& enc, const Tensor& w, MTL::Buffe
             after(enc, std::format("gemm BF16 {}x{}", k, n));
         return;
     }
-    // A few tokens (decode, speculative verification) stay on the GEMV, which reads each weight once for them.
-    if (T >= gemm_min_tokens_ && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type)) {
+    // A few tokens (decode, speculative verification) stay on the GEMV, which reads each weight once for them; F16
+    // matrices have only the GEMM.
+    const bool gemm_only = mtl::Gemm::supports(w.type) && !mtl::Gemv::supports(w.type);
+    if (gemm_only ||
+        (T >= gemm_min_tokens_ && (n >= 256 || (ldy && ldy != n)) && k % 32 == 0 && mtl::Gemm::supports(w.type))) {
         gemm_->encode(enc, w.type, k, n, T, w.buf, w.off, halves(enc, x, x_off, T, k, 0), 0, y, y_off, ldy);
         if (tel_ == Telemetry::kernels)
             after(enc, std::format("gemm {} {}x{}", gguf::traits(w.type).name, k, n));
