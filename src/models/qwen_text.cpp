@@ -25,6 +25,7 @@ struct HeadsPartialArgs {
 struct AttnArgs {
     uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
     float scale;
+    uint32_t limits = 0; // 1: per-query key limits in buffer 5
 };
 
 safetensors::Files open_files(const std::string& path)
