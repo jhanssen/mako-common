@@ -1183,3 +1183,75 @@ kernel void flash_attn_sparse_128(device const half* q [[buffer(0)]], device con
         o[uint64_t(dst) * a.width + h * D + col] = acc[i] * inv[slot];
     }
 }
+
+// MiniMax-H3's transformer: RMS norms modulated per row of the packed sequence (each row its own (timestep,
+// modality) modulation), gated residuals per row, and a pruned checkpoint's modulation from its curve table.
+
+struct RowModArgs {
+    uint n;         // row width
+    float eps;
+    uint shift_off; // of the shift within a row's modulation, in floats
+    uint scale_off; // of the scale
+};
+
+// y = x / rms(x) * w * (1 + scale) + shift over each row, the row's modulation at mods + off[row] (shift and scale at
+// shift_off and scale_off of it); one threadgroup per row.
+kernel void rms_mod_rows(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+                         device const float* mods [[buffer(2)]], device const uint* off [[buffer(3)]],
+                         device float* y [[buffer(4)]], constant RowModArgs& a [[buffer(5)]],
+                         uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float scratch[TG / 32];
+    device const float4* xr = reinterpret_cast<device const float4*>(x + uint64_t(row) * a.n);
+    device float4* yr = reinterpret_cast<device float4*>(y + uint64_t(row) * a.n);
+    device const float4* w4 = reinterpret_cast<device const float4*>(w);
+    device const float4* sh = reinterpret_cast<device const float4*>(mods + off[row] + a.shift_off);
+    device const float4* sc = reinterpret_cast<device const float4*>(mods + off[row] + a.scale_off);
+    const uint n4 = a.n / 4;
+    float s = 0.0f;
+    for (uint i = tid; i < n4; i += TG) {
+        const float4 v = xr[i];
+        s += dot(v, v);
+    }
+    const float inv = rsqrt(tg_sum(s, scratch, tid) / float(a.n) + a.eps);
+    for (uint i = tid; i < n4; i += TG)
+        yr[i] = xr[i] * inv * w4[i] * (1.0f + sc[i]) + sh[i];
+}
+
+struct GateRowsArgs {
+    uint n;
+    uint gate_off; // of the gate within a row's modulation, in floats
+};
+
+// x[row] += gate[row] * y[row], the row's gate at mods + off[row] + gate_off. Grid (n, rows).
+kernel void gate_add_rows(device float* x [[buffer(0)]], device const float* y [[buffer(1)]],
+                          device const float* mods [[buffer(2)]], device const uint* off [[buffer(3)]],
+                          constant GateRowsArgs& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= a.n)
+        return;
+    const uint64_t o = uint64_t(gid.y) * a.n + gid.x;
+    x[o] += mods[off[gid.y] + a.gate_off + gid.x] * y[o];
+}
+
+// A pruned checkpoint's modulation: out[u][o] = b[o] + sum_j w[o][j] c[u][j] over 8 curve coordinates a timestep,
+// in float. Grid (n, U).
+template <typename W>
+kernel void curve_mods_t(device const W* w [[buffer(0)]], device const float* b [[buffer(1)]],
+                         device const float* c [[buffer(2)]], device float* out [[buffer(3)]],
+                         constant uint2& a [[buffer(4)]], uint2 gid [[thread_position_in_grid]])
+{
+    const uint o = gid.x, u = gid.y;
+    if (o >= a.x || u >= a.y)
+        return;
+    float s = b[o];
+    for (uint j = 0; j < 8; ++j)
+        s += float(w[uint64_t(o) * 8 + j]) * c[u * 8 + j];
+    out[uint64_t(u) * a.x + o] = s;
+}
+template [[host_name("curve_mods")]] kernel void curve_mods_t<bfloat>(device const bfloat*, device const float*,
+                                                                      device const float*, device float*,
+                                                                      constant uint2&, uint2);
+template [[host_name("curve_mods_f16")]] kernel void curve_mods_t<half>(device const half*, device const float*,
+                                                                        device const float*, device float*,
+                                                                        constant uint2&, uint2);
