@@ -52,6 +52,11 @@ public:
     bool has_audio() const { return static_cast<bool>(audio_in_.buf); }
     // The video heads: one, or one per step of a distilled schedule.
     uint32_t heads() const { return uint32_t(video_out_.size()); }
+    // A head blended from the bank: `weights` over heads() (summing to 1) weigh each head's rows and bias into one
+    // that step() takes as kBlendHead, until the next blend. For a step across several of the distilled grid's
+    // intervals, the heads of the intervals it spans by the sigma each covers.
+    static constexpr uint32_t kBlendHead = UINT32_MAX;
+    uint32_t blend_heads(std::span<const float> weights);
 
     static constexpr uint32_t kDim = 5376, kHeads = 56, kText = 5120, kVideoPatch = 96, kAudioChannels = 32;
     static constexpr uint32_t kTimeFreq = 256, kTimeDim = 2688, kRot = 96, kRopeFreqs = 16;
@@ -166,6 +171,7 @@ private:
     Tensor refiner_norm_, cond_, cond_b_, video_in_, video_in_b_, audio_in_, audio_in_b_;
     Tensor t1_, t1_b_, t2_, t2_b_, final_adaln_, final_adaln_b_, final_norm_, audio_out_, audio_out_b_;
     std::vector<Tensor> video_out_, video_out_b_; // a head per distilled step (one for the video model)
+    Tensor video_out_blend_, video_out_blend_b_;  // the blend of blend_heads(), once made
     bool interleaved_ = false; // the file's q / k / v rows interleaved per head
     uint32_t int8_ = 0;        // the Int8 mask
     // A pruned checkpoint: the time embedder and the 2688-wide modulation inputs folded into an 8-coordinate curve

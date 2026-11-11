@@ -147,6 +147,33 @@ void H3::add_head(std::span<const float> w, std::span<const float> b, uint32_t n
     video_out_b_.push_back(tb);
 }
 
+uint32_t H3::blend_heads(std::span<const float> weights)
+{
+    if (weights.size() != video_out_.size())
+        throw std::runtime_error(std::format("blend_heads: {} weights for {} heads", weights.size(), video_out_.size()));
+    if (!video_out_blend_.buf) {
+        video_out_blend_ = reserve(uint64_t(kOutRows) * kDim * 4, gguf::Type::F32, {kDim, kOutRows});
+        video_out_blend_b_ = reserve(uint64_t(kVideoPatch) * 4, gguf::Type::F32, {kVideoPatch});
+    }
+    auto at = [](const Tensor& t) { return reinterpret_cast<float*>(static_cast<char*>(t.buf->contents()) + t.off); };
+    float* o = at(video_out_blend_);
+    float* ob = at(video_out_blend_b_);
+    std::fill(o, o + uint64_t(kOutRows) * kDim, 0.0f);
+    std::fill(ob, ob + kVideoPatch, 0.0f);
+    for (size_t s = 0; s < weights.size(); ++s) {
+        if (weights[s] == 0.0f)
+            continue;
+        const float* w = at(video_out_[s]);
+        const float* b = at(video_out_b_[s]);
+        const uint64_t nb = video_out_b_[s].dims[0];
+        for (uint64_t i = 0; i < uint64_t(kVideoPatch) * kDim; ++i)
+            o[i] += weights[s] * w[i];
+        for (uint64_t i = 0; i < std::min<uint64_t>(nb, kVideoPatch); ++i)
+            ob[i] += weights[s] * b[i];
+    }
+    return kBlendHead;
+}
+
 void H3::load_heads(const safetensors::Files& f, const std::string& heads)
 {
     const uint32_t n = kVideoPatch;
@@ -542,8 +569,11 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
         throw std::runtime_error("begin() first");
     if (video.size() != uint64_t(V) * kVideoPatch || audio.size() != uint64_t(A) * kAudioChannels)
         throw std::runtime_error("video rows of 96 and audio rows of 32 as the layout has them");
-    if (head >= video_out_.size())
-        throw std::runtime_error(std::format("head {} of {}", head, video_out_.size()));
+    if (head == kBlendHead ? !video_out_blend_.buf : head >= video_out_.size())
+        throw std::runtime_error(std::format("head {} of {}", head == kBlendHead ? "blend" : std::to_string(head),
+                                             video_out_.size()));
+    const Tensor& head_w = head == kBlendHead ? video_out_blend_ : video_out_[head];
+    const Tensor& head_b = head == kBlendHead ? video_out_blend_b_ : video_out_b_[head];
     const uint32_t Tg = round_up(S, 256), nb = uint32_t(blocks_.size());
     // The distinct timesteps, sorted, and each row's (timestep, tag) modulation: row offsets into a block's [U][96768]
     // modulation output, and into the final layer's [U][10752].
@@ -678,7 +708,7 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     probe(enc, "norm_out", -1, xn, uint64_t(S) * D);
     // The heads over the generated rows: the audio's then the video's, the sequence's last.
     const uint32_t GV = V - C, GA = 2 * l.audio, gv0 = S - GV, ga0 = gv0 - GA;
-    proj(enc, video_out_[head], xn, uint64_t(gv0) * D * 4, vout, 0, GV);
+    proj(enc, head_w, xn, uint64_t(gv0) * D * 4, vout, 0, GV);
     if (GA)
         proj(enc, audio_out_, xn, uint64_t(ga0) * D * 4, aout, 0, GA);
     enc->endEncoding();
@@ -700,7 +730,7 @@ H3::Velocity H3::step(std::span<const float> video, std::span<const float> audio
     v.video.assign(uint64_t(V) * kVideoPatch, 0.0f);
     v.audio.assign(uint64_t(A) * kAudioChannels, 0.0f);
     const auto* vo = static_cast<const float*>(vout->contents());
-    const Tensor& hb = video_out_b_[head];
+    const Tensor& hb = head_b;
     const auto* vb = reinterpret_cast<const float*>(static_cast<const char*>(hb.buf->contents()) + hb.off);
     for (uint32_t r = 0; r < V - C; ++r)
         for (uint32_t i = 0; i < kVideoPatch; ++i)
