@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <format>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <queue>
@@ -398,6 +399,23 @@ std::expected<Tokenizer, std::string> Tokenizer::load_json(const std::string& pa
     }
     for (const auto& [id, special] : added)
         t.types_[size_t(id)] = special ? TokenType::Control : TokenType::UserDefined;
+    // Special tokens a tokenizer_config.json beside it adds (additional_special_tokens the vocabulary lacks) take the
+    // ids after the last, in order, as the reference tokenizer gives them.
+    const std::filesystem::path cfg = std::filesystem::path(path).parent_path() / "tokenizer_config.json";
+    if (std::ifstream cin(cfg, std::ios::binary); cin) {
+        const std::string ctext{std::istreambuf_iterator<char>(cin), std::istreambuf_iterator<char>()};
+        glz::generic c;
+        if (!glz::read_json(c, ctext) && c.is_object() && c.contains("additional_special_tokens") &&
+            c["additional_special_tokens"].is_array())
+            for (const auto& a : c["additional_special_tokens"].get_array()) {
+                if (!a.is_string() || t.ids_.contains(a.get_string()))
+                    continue;
+                const int32_t id = int32_t(t.tokens_.size());
+                t.tokens_.push_back(a.get_string());
+                t.types_.push_back(TokenType::Control);
+                t.ids_.emplace(a.get_string(), id);
+            }
+    }
     const auto& merges = model["merges"].get_array();
     for (size_t i = 0; i < merges.size(); ++i) {
         const auto& m = merges[i];

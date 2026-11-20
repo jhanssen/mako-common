@@ -72,6 +72,13 @@ add_library(mako_safetensors STATIC ${S}/safetensors/safetensors.cpp)
 target_include_directories(mako_safetensors PUBLIC ${S})
 target_link_libraries(mako_safetensors PUBLIC mako_gguf PRIVATE glaze_headers)
 
+# The transformer models' common ground: weights from safetensors, attention heads and flash attention, LoRAs, and the
+# Qwen text encoders the image and video models condition on.
+add_library(mako_models STATIC ${S}/models/runtime.cpp ${S}/models/lora.cpp ${S}/models/qwen_text.cpp
+            ${S}/models/conv.cpp ${S}/models/qwen_vision.cpp ${S}/models/h3.cpp ${S}/models/h3_vae.cpp)
+target_include_directories(mako_models PUBLIC ${S})
+target_link_libraries(mako_models PUBLIC mako_gpu mako_safetensors mako_log PRIVATE glaze_headers)
+
 add_library(mako_text STATIC ${S}/text/tokenizer.cpp ${S}/text/unigram.cpp)
 target_include_directories(mako_text PUBLIC ${S})
 target_link_libraries(mako_text PUBLIC mako_gguf PRIVATE glaze_headers)
@@ -90,4 +97,5 @@ target_link_libraries(mako_memory PUBLIC mako_log PRIVATE glaze_headers httplib_
 if(PROJECT_IS_TOP_LEVEL)
     enable_testing()
     add_subdirectory(tests)
+    add_subdirectory(bench)
 endif()

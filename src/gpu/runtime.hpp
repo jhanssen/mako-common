@@ -91,11 +91,17 @@ protected:
                       const std::string& what, bool keep_bf16 = false);
 
     MTL::Buffer* scratch(const std::string& name, uint64_t bytes);
+    // Frees a scratch buffer (one used only while loading).
+    void drop_scratch(const std::string& name) { scratch_.erase(name); }
     MTL::ComputePipelineState* pso(const std::string& fn);
     // Throws when `tg` has more threads than pipeline `fn` can run in one threadgroup: Metal skips such a dispatch
     // without an error, leaving its outputs stale. dispatch() checks; direct dispatches above 256 threads call it.
     // MAKO_THREADGROUP_CAP=N lowers every pipeline's limit to N (a test hook).
     void check_fit(MTL::ComputePipelineState* p, MTL::Size tg, std::string_view fn) const;
+    // An I8 copy (int8 rows with a float scale each after the rows, the GEMM's format) of rows x cols values at src
+    // (bfloat, or float with f32) in the resident weights; waits for it.
+    Tensor quantize_i8(const MTL::Buffer* src, uint64_t off, uint32_t cols, uint32_t rows, std::vector<uint64_t> dims,
+                       bool f32 = false);
 
     // proj() of at least this many tokens uses the GEMM (fewer: the GEMV, which reads each weight once for them and
     // gives every token the same result as alone).
