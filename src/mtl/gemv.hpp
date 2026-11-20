@@ -84,6 +84,16 @@ public:
     void set_own_kernels(bool on) { own_kernels_ = on; }
     // The threadgroup grid encode_indexed dispatches for all a.batch ids.
     MTL::Size indexed_grid(const Args& a);
+    // a.batch matrices of short rows (Q8_0 or F32, k <= 512 and a multiple of 32), matrix m at w_off + m * w_mat,
+    // over a.t <= 8 tokens: y[t * y_tok + m * y_mat + r] = W_m[r] . x[t * x_tok + m * x_mat ..] (strides in
+    // floats), each weight read once for all the tokens. False for a shape it does not handle.
+    struct ShortStrides {
+        uint64_t w_mat = 0;
+        uint32_t x_tok = 0, x_mat = 0, y_tok = 0, y_mat = 0;
+    };
+    bool encode_short_batch(MTL::ComputeCommandEncoder* enc, const Args& a, const MTL::Buffer* w, uint64_t w_off,
+                            const MTL::Buffer* x, uint64_t x_off, const MTL::Buffer* y, uint64_t y_off,
+                            const ShortStrides& s);
 
 private:
     struct Kernel {
