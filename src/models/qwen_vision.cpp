@@ -138,8 +138,9 @@ void QwenVision::load(const std::string& dir)
         m.fc1_b = upload_f32(f, p + "linear_fc1.bias");
         m.fc2 = upload(f, p + "linear_fc2.weight", true);
         m.fc2_b = upload_f32(f, p + "linear_fc2.bias");
-        if (m.fc1.dims[0] != kMerged || m.fc2.dims[1] != kOut)
+        if (m.fc1.dims[0] != kMerged || m.fc2.dims[0] != kMerged || (out_ && m.fc2.dims[1] != out_))
             throw std::runtime_error(p + ": unexpected shapes");
+        out_ = uint32_t(m.fc2.dims[1]);
         return m;
     };
     merger_ = merger(v + "merger.");
@@ -169,7 +170,7 @@ void QwenVision::merge(MTL::ComputeCommandEncoder*& enc, const Merger& mg, MTL::
     bias(enc, ff, mg.fc1_b, kMerged, m);
     unary(enc, "gelu_erf", ff, m * kMerged);
     proj(enc, mg.fc2, ff, 0, out, 0, m);
-    bias(enc, out, mg.fc2_b, kOut, m);
+    bias(enc, out, mg.fc2_b, out_, m);
 }
 
 QwenVision::Features QwenVision::encode(std::span<const uint8_t> first, std::span<const uint8_t> second, uint32_t h,
@@ -235,10 +236,10 @@ QwenVision::Features QwenVision::encode(std::span<const uint8_t> first, std::spa
     MTL::Buffer* y = scratch("v_y", uint64_t(n) * kDim * 4);
     MTL::Buffer* ff = scratch("v_ff", uint64_t(n) * kFfnPad * 4);
     MTL::Buffer* mt = scratch("v_mt", uint64_t(n) * kDim * 4);
-    MTL::Buffer* out = scratch("v_out", uint64_t(m) * kOut * 4);
+    MTL::Buffer* out = scratch("v_out", uint64_t(m) * out_ * 4);
     std::array<MTL::Buffer*, kDeepstack> deep;
     for (uint32_t j = 0; j < kDeepstack; ++j)
-        deep[j] = scratch(std::format("v_deep{}", j), uint64_t(m) * kOut * 4);
+        deep[j] = scratch(std::format("v_deep{}", j), uint64_t(m) * out_ * 4);
     MTL::CommandBuffer* cb = ctx_.queue()->commandBuffer();
     cur_cb_ = cb;
     MTL::ComputeCommandEncoder* enc = encoder(cb, 0, -1);
@@ -288,10 +289,10 @@ QwenVision::Features QwenVision::encode(std::span<const uint8_t> first, std::spa
     F.rows = gh / kMerge;
     F.cols = bw;
     const auto* o = static_cast<const float*>(out->contents());
-    F.embeds.assign(o, o + uint64_t(m) * kOut);
+    F.embeds.assign(o, o + uint64_t(m) * out_);
     for (uint32_t j = 0; j < kDeepstack; ++j) {
         const auto* d = static_cast<const float*>(deep[j]->contents());
-        F.deepstack[j].assign(d, d + uint64_t(m) * kOut);
+        F.deepstack[j].assign(d, d + uint64_t(m) * out_);
     }
     return F;
 }

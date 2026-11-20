@@ -26,6 +26,7 @@ struct HeadsPartialArgs {
 struct AttnArgs {
     uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
     float scale;
+    uint32_t limits = 0; // 1: per-query key limits in buffer 5
 };
 
 uint16_t to_bf16(float f)
@@ -261,15 +262,24 @@ void TransformerRuntime::heads_partial(MTL::ComputeCommandEncoder*& enc, MTL::Bu
 
 void TransformerRuntime::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v,
                                    MTL::Buffer* o, uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad,
-                                   uint32_t n_heads, uint32_t kv_heads, uint32_t q_pos0, uint32_t block, uint32_t dim)
+                                   uint32_t n_heads, uint32_t kv_heads, uint32_t q_pos0, uint32_t block, uint32_t dim,
+                                   MTL::Buffer* limits)
 {
     if (dim != 64 && dim != 128 && dim != 256)
         throw std::runtime_error(std::format("attention: heads of {}", dim));
     const AttnArgs a{n_q, q_pad, n_k, k_pad, n_heads, kv_heads, q_pos0, block, n_heads * dim,
-                     1.0f / std::sqrt(float(dim))};
+                     1.0f / std::sqrt(float(dim)), limits ? 1u : 0u};
     // 64 and 128-wide heads: the four simdgroups cooperating on 64 rows; 256-wide: each on its own 16.
-    dispatch(enc, dim == 256 ? std::string("flash_attn_sg_256_16x32_4") : std::format("flash_attn_coop_{}_32", dim),
-             {q, k, v, o}, &a, sizeof(a), MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1), false);
+    const std::string fn = dim == 256 ? std::string("flash_attn_sg_256_16x32_4") : std::format("flash_attn_coop_{}_32", dim);
+    enc->setComputePipelineState(pso(fn));
+    enc->setBuffer(q, 0, 0);
+    enc->setBuffer(k, 0, 1);
+    enc->setBuffer(v, 0, 2);
+    enc->setBuffer(o, 0, 3);
+    enc->setBytes(&a, sizeof(a), 4);
+    enc->setBuffer(limits ? limits : q, 0, 5);
+    enc->dispatchThreadgroups(MTL::Size(q_pad / kAttnRows, n_heads, 1), MTL::Size(128, 1, 1));
+    after(enc, fn);
 }
 
 namespace {

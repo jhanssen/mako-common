@@ -88,11 +88,12 @@ protected:
                        uint32_t dim, uint32_t rot, uint32_t heads, uint32_t T, uint32_t n_pad, MTL::Buffer* cs,
                        const Tensor* w, float eps, MTL::Buffer* y, MTL::Buffer* map = nullptr);
     // Flash attention over half tiles q [heads][q_pad][dim], k and v [kv_heads][k_pad][dim] into o [n_q][heads *
-    // dim] floats. block: positions from here on see each other both ways; below it, causal (0: all both ways).
-    // dim 64, 128 or 256.
+    // dim] floats. block: positions from here on see each other both ways; below it, causal (0: all both ways); or
+    // limits, a uint per query row (q_pad of them, non-decreasing): query position p sees the keys before limits[p]
+    // (text segments causal, an image block all before its end, the generated block everything). dim 64, 128 or 256.
     void attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, MTL::Buffer* v, MTL::Buffer* o,
                    uint32_t n_q, uint32_t q_pad, uint32_t n_k, uint32_t k_pad, uint32_t heads, uint32_t kv_heads,
-                   uint32_t q_pos0, uint32_t block, uint32_t dim = kHeadDim);
+                   uint32_t q_pos0, uint32_t block, uint32_t dim = kHeadDim, MTL::Buffer* limits = nullptr);
     // Block-sparse attention over 128-wide heads for a sequence whose first n_cubes * 64 rows are 64-row cubes of
     // video tokens (padding rows with valid 0) and whose rows [dense0, dense1) are the others: cube_select picks, per
     // head and query cube, the `topk` key cubes by the dot product of the cubes' mean q and k (cnt[c]: a cube's valid

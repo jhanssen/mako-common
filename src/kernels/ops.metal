@@ -61,6 +61,7 @@ struct AttnArgs {
     uint block;    // positions from here on see each other both ways (the image); below, causal
     uint width;    // o row length
     float scale;
+    uint limits;   // 1: query position p sees the keys before limits[p] instead (buffer 5, non-decreasing)
 };
 
 // x = gelu(x), the tanh approximation.
@@ -106,7 +107,8 @@ kernel void heads_rows(device const half* src [[buffer(0)]], device half* dst [[
 template <int D, int R, int K, int NSG>
 kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
                           device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
-                          constant AttnArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          constant AttnArgs& a [[buffer(4)]], device const uint* limits [[buffer(5)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
                           ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]])
 {
 #pragma METAL fp math_mode(relaxed) // INF / NaN are values here (the default fast math assumes none: MSL 1.6.3)
@@ -144,7 +146,9 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
     const uint r = lane / TPR, c0 = (lane % TPR) * CPT;
     const uint pos = a.q_pos0 + q0 + r;
     const uint last = a.q_pos0 + min(q0 + R, a.n_q) - 1;
-    const uint n_keys = last >= a.block ? a.n_k : min(a.n_k, last + 1);
+    const bool lim = a.limits != 0;
+    const uint n_keys = lim ? min(a.n_k, limits[last]) : last >= a.block ? a.n_k : min(a.n_k, last + 1);
+    const uint seen_to = lim ? limits[pos] : 0;
     const float scale = a.scale * 1.4426950408889634f;
     float m = -INFINITY, l = 0.0f;
     for (uint j0 = 0; j0 < n_keys; j0 += K) {
@@ -158,7 +162,7 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
         float x[CPT], mt = -INFINITY;
         for (uint c = 0; c < CPT; ++c) {
             const uint j = j0 + c0 + c;
-            const bool seen = j < a.n_k && (j <= pos || (pos >= a.block && j >= a.block));
+            const bool seen = j < a.n_k && (lim ? j < seen_to : (j <= pos || (pos >= a.block && j >= a.block)));
             x[c] = seen ? s[r * K + c0 + c] * scale : -INFINITY;
             mt = max(mt, x[c]);
         }
@@ -204,8 +208,8 @@ kernel void flash_attn_sg(device const half* q [[buffer(0)]], device const half*
 
 #define FLASH_ATTN_SG(d, r, k, nsg)                                                                                   \
     template [[host_name("flash_attn_sg_" #d "_" #r "x" #k "_" #nsg)]] kernel void flash_attn_sg<d, r, k, nsg>(      \
-        device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, \
-        ushort);
+        device const half*, device const half*, device const half*, device float*, constant AttnArgs&,               \
+        device const uint*, uint2, ushort, ushort);
 FLASH_ATTN_SG(128, 16, 32, 4)
 // 64 keys a pass: the same at 4k keys, 12% faster at 19k (384 -> 336 ms for 56 heads); the runtime's 64 and 128-wide
 // heads now run flash_attn_coop below (this one is the bench's reference), 256-wide ones flash_attn_sg_256_16x32_4.
@@ -230,7 +234,8 @@ FLASH_ATTN_SG(64, 16, 32, 4)
 template <int D, int K>
 kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
                             device const half* v [[buffer(2)]], device float* o [[buffer(3)]],
-                            constant AttnArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                            constant AttnArgs& a [[buffer(4)]], device const uint* limits [[buffer(5)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
                             ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]])
 {
 #pragma METAL fp math_mode(relaxed) // INF / NaN are values here
@@ -267,7 +272,9 @@ kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const hal
     const uint c_base = 4 * ((lane & 1) + 2 * ((lane >> 3) & 1)) + 16 * sgx; // within each 32 columns
     const bool writer = (lane & 9) == 0;                                      // one lane a row for the exchanges
     const uint last = a.q_pos0 + min(q0 + R, a.n_q) - 1;
-    const uint n_keys = last >= a.block ? a.n_k : min(a.n_k, last + 1);
+    const bool lim = a.limits != 0;
+    const uint n_keys = lim ? min(a.n_k, limits[last]) : last >= a.block ? a.n_k : min(a.n_k, last + 1);
+    const uint first_to = lim ? limits[a.q_pos0 + q0] : 0; // the tile's first row sees the fewest keys
     const float scale = a.scale * 1.4426950408889634f;
     float m[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY}, l[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     uint buf = 0;
@@ -277,8 +284,9 @@ kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const hal
         auto kt = tk.slice(0, int(j0));
         qk.run(tq, kt, sc);
         // Scaled scores, masked where the pass reaches keys a row may not see; this lane's maxima per row.
-        const bool plain = j0 + K <= a.n_k && ((a.q_pos0 + q0 >= a.block && j0 >= a.block) ||
-                                               j0 + K - 1 <= a.q_pos0 + q0);
+        const bool plain = j0 + K <= a.n_k && (lim ? j0 + K <= first_to
+                                                   : (a.q_pos0 + q0 >= a.block && j0 >= a.block) ||
+                                                         j0 + K - 1 <= a.q_pos0 + q0);
         float mt[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
         for (uint16_t i = 0; i < CAP; ++i) {
             const uint slot = ((i >> 2) & 1) | ((i / (8 * CQ)) << 1);
@@ -286,7 +294,7 @@ kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const hal
             if (!plain) {
                 const uint j = j0 + ((i >> 3) % CQ) * 32 + c_base + (i & 3);
                 const uint pos = a.q_pos0 + q0 + r0 + (slot & 1) * 8 + (slot >> 1) * 32;
-                if (!(j < a.n_k && (j <= pos || (pos >= a.block && j >= a.block))))
+                if (!(j < a.n_k && (lim ? j < limits[pos] : (j <= pos || (pos >= a.block && j >= a.block)))))
                     x = -INFINITY;
             }
             sc[i] = x;
@@ -363,8 +371,8 @@ kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const hal
 }
 #define FLASH_ATTN_COOP(d, k)                                                                                        \
     template [[host_name("flash_attn_coop_" #d "_" #k)]] kernel void flash_attn_coop<d, k>(                           \
-        device const half*, device const half*, device const half*, device float*, constant AttnArgs&, uint2, ushort, \
-        ushort);
+        device const half*, device const half*, device const half*, device float*, constant AttnArgs&,               \
+        device const uint*, uint2, ushort, ushort);
 FLASH_ATTN_COOP(128, 32)
 FLASH_ATTN_COOP(64, 32)
 
