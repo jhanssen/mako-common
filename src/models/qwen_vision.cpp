@@ -27,9 +27,10 @@ uint16_t to_bf16(float f)
     return uint16_t((u + 0x7fff + ((u >> 16) & 1)) >> 16);
 }
 
-struct LnArgs {
+struct LayerNormArgs {
     uint32_t n;
     float eps;
+    uint32_t ystride = 0;
 };
 
 } // namespace
@@ -150,7 +151,7 @@ void QwenVision::load(const std::string& dir)
 void QwenVision::layer_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, const Tensor& w, const Tensor& b,
                             MTL::Buffer* y, uint32_t rows, uint32_t n)
 {
-    const LnArgs a{n, eps_};
+    const LayerNormArgs a{n, eps_};
     dispatch_at(enc, "layer_norm", {Arg{x, 0}, Arg{w.buf, w.off}, Arg{b.buf, b.off}, Arg{y, 0}}, &a, sizeof(a),
                 MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1), false);
 }

@@ -719,15 +719,21 @@ kernel void ln_affine(device const float* x [[buffer(0)]], device const float* s
         yr[i] = (xr[i] - mean) * inv * (1.0f + scale[i]) + shift[i];
 }
 
+struct LayerNormArgs {
+    uint n;
+    float eps;
+    uint ystride; // y row stride in elements (0: n)
+};
+
 // y = layer_norm(x) * w + b over each row; one threadgroup per row.
 kernel void layer_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
                        device const float* b [[buffer(2)]], device float* y [[buffer(3)]],
-                       constant LnAffineArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                       constant LayerNormArgs& a [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
                        uint tid [[thread_position_in_threadgroup]])
 {
     threadgroup float scratch[TG / 32];
     device const float* xr = x + uint64_t(row) * a.n;
-    device float* yr = y + uint64_t(row) * a.n;
+    device float* yr = y + uint64_t(row) * (a.ystride ? a.ystride : a.n);
     float s = 0.0f;
     for (uint i = tid; i < a.n; i += TG)
         s += xr[i];

@@ -18,9 +18,10 @@ namespace mako::models {
 
 namespace {
 
-struct LnArgs {
+struct LayerNormArgs {
     uint32_t n;
     float eps;
+    uint32_t ystride = 0;
 };
 
 constexpr float kEps = 1e-5f, kRopeTheta = 100.0f;
@@ -231,7 +232,7 @@ void H3Vae::vit(std::span<const float> voxels, uint32_t f, uint32_t th, uint32_t
         probe(enc, "vit_block", int(b), x, uint64_t(N) * D);
     }
     {
-        const LnArgs a{D, kEps};
+        const LayerNormArgs a{D, kEps};
         enc->setComputePipelineState(pso("layer_norm"));
         enc->setBuffer(x, 0, 0);
         enc->setBuffer(out_norm_w_.buf, out_norm_w_.off, 1);
