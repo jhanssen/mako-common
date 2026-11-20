@@ -314,7 +314,8 @@ std::expected<Tokenizer, std::string> Tokenizer::load(const gguf::File& meta)
     if (meta.get_string("tokenizer.ggml.model").value_or("") != "gpt2")
         return std::unexpected("tokenizer model is not byte-level BPE");
     const auto pre = meta.get_string("tokenizer.ggml.pre").value_or("");
-    const bool deepseek = pre == "joyai-llm" || pre == "deepseek-v3";
+    // Hy4's pre-tokenizer splits as DeepSeek-V3's.
+    const bool deepseek = pre == "joyai-llm" || pre == "deepseek-v3" || pre == "hy_v4";
     if (pre != "glm4" && pre != "glm5" && !deepseek)
         return std::unexpected(std::format("unsupported pre-tokenizer '{}'", pre));
 

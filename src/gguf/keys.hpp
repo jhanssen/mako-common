@@ -79,6 +79,27 @@ public:
         return out;
     }
 
+    // A per-layer bool array (all false, noted missing, when absent or of another length).
+    std::vector<bool> bools(std::string_view key, uint32_t n)
+    {
+        const Value* v = f_.find(full(key));
+        const auto* a = v ? std::get_if<Array>(v) : nullptr;
+        std::vector<bool> out(n, false);
+        if (!a) {
+            note(key);
+            return out;
+        }
+        if (a->items.size() != n)
+            missing += std::format(" {}(length {} != {})", key, a->items.size(), n);
+        for (size_t i = 0; i < a->items.size() && i < n; ++i) {
+            if (auto* b = std::get_if<bool>(&a->items[i]))
+                out[i] = *b;
+            else
+                missing += std::format(" {}(not bools)", key);
+        }
+        return out;
+    }
+
     // An integer array (empty, noted missing, when absent; required: false leaves it unnoted).
     std::vector<int64_t> ints(std::string_view key, bool required = true)
     {

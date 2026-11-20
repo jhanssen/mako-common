@@ -701,7 +701,7 @@ struct GemvJob {
 };
 enum JobType : uint {
     JOB_Q6_K = 0, JOB_Q8_0 = 1, JOB_F32_4 = 2, JOB_IQ2_XXS = 3, JOB_IQ3_XXS = 4, JOB_IQ2_S = 5, JOB_IQ3_S = 6,
-    JOB_Q5_K = 7, JOB_IQ2_XS = 8, JOB_IQ1_S = 9, JOB_IQ1_M = 10,
+    JOB_Q5_K = 7, JOB_IQ2_XS = 8, JOB_IQ1_S = 9, JOB_IQ1_M = 10, JOB_IQ4_XS = 11,
 };
 
 kernel void mako_mul_mv_jobs(constant GemvJob* jobs [[buffer(0)]], constant uint& njobs [[buffer(1)]],
@@ -740,6 +740,7 @@ kernel void mako_mul_mv_jobs(constant GemvJob* jobs [[buffer(0)]], constant uint
     case JOB_IQ2_XS: mako_iq2_xs_impl<N_R0_IQ2_XS>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
     case JOB_IQ1_S: mako_iq1_s_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
     case JOB_IQ1_M: mako_iq1_m_impl<4>(args, src0, src1, dst, shmem, tg, tiisg, sgitg); break;
+    case JOB_IQ4_XS: mmv_fn<kernel_mul_mv_iq4_xs_f32_impl<N_R0_IQ4_XS>>(args, src0, src1, dst, shmem, tg, tiitg, tiisg, sgitg); break;
     default: break;
     }
 }
