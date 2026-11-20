@@ -1,5 +1,6 @@
 #include "quant/dequant.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -118,7 +119,7 @@ bool can_dequant(gguf::Type type)
 {
     using gguf::Type;
     return type == Type::F32 || type == Type::F16 || type == Type::BF16 || type == Type::Q8_0 || type == Type::Q6_K ||
-           type == Type::Q4_K || type == Type::Q5_K || type == Type::IQ4_NL;
+           type == Type::Q4_K || type == Type::Q5_K || type == Type::IQ4_NL || type == Type::F8_E4M3;
 }
 
 void dequant_row(gguf::Type type, const std::byte* src, float* dst, uint64_t k)
@@ -139,6 +140,14 @@ void dequant_row(gguf::Type type, const std::byte* src, float* dst, uint64_t k)
     case Type::IQ4_NL: iq4_nl(src, dst, k); return;
     case Type::Q4_K: qk(src, dst, k, 4); return;
     case Type::Q5_K: qk(src, dst, k, 5); return;
+    case Type::F8_E4M3:
+        for (uint64_t i = 0; i < k; ++i) {
+            const auto c = uint8_t(src[i]);
+            const int e = (c >> 3) & 15, m = c & 7;
+            const float v = (c & 127) == 127 ? NAN : e ? std::ldexp(float(8 + m), e - 10) : std::ldexp(float(m), -9);
+            dst[i] = c & 128 ? -v : v;
+        }
+        return;
     default: break;
     }
     throw std::runtime_error("no CPU dequantization for " + std::string(gguf::traits(type).name));

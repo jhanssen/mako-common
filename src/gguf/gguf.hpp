@@ -47,6 +47,8 @@ enum class Type : uint32_t {
     TQ2_0 = 35,
     MXFP4 = 39,
     MXFP8 = 43, // a scale byte (E8M0) then 32 E4M3 codes
+    // GGUF type 43 in trees that number plain E4M3 bytes there (no scale); told from MXFP8 by the data's size.
+    F8_E4M3 = 0x10000 + 43,
 };
 
 struct TypeTraits {

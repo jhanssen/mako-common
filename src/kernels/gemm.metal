@@ -226,12 +226,13 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i))
             acc[i] = 0.0f;
-    for (uint k = 0; k < a.k; k += KD) {
-        // Each 32-wide piece of a weight row is staged by one thread; past k, zeros.
+    const uint k_main = a.k / KD * KD;
+    for (uint k = 0; k < k_main; k += KD) {
+        // Each 32-wide piece of a weight row is staged by one thread.
         for (uint s = tid; s < TN * (KD / 32); s += NSG * 32) {
             const uint r = s / (KD / 32), c = (s % (KD / 32)) * 32;
             threadgroup half* wo = ws + r * KD + c;
-            if (n0 + r < a.n && k + c < a.k) {
+            if (n0 + r < a.n) {
                 dequant32<Type>(w + uint64_t(n0 + r) * a.row_bytes, k + c, wo);
             } else {
                 for (short i = 0; i < 32; ++i)
@@ -242,6 +243,30 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
         auto xk = tx.slice(int(k), int(t0));
         op.run(xk, tw, acc);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The rest 32 columns at a time: a KD-wide step would read x past the ends of its rows (matmul2d does not
+    // bound those reads by the extents), and garbage times the zero weights there is not always zero.
+    if (k_main < a.k) {
+        constexpr int KR = 32;
+        tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tr(ws, dextents<int32_t, 2>(KR, TN));
+        constexpr auto rdesc = matmul2d_descriptor(TM, TN, KR, false, true, false,
+                                                   matmul2d_descriptor::mode::multiply_accumulate);
+        matmul2d<rdesc, execution_simdgroups<NSG>> rop;
+        for (uint k = k_main; k < a.k; k += KR) {
+            for (uint r = tid; r < uint(TN); r += NSG * 32) {
+                threadgroup half* wo = ws + r * KR;
+                if (n0 + r < a.n) {
+                    dequant32<Type>(w + uint64_t(n0 + r) * a.row_bytes, k, wo);
+                } else {
+                    for (short i = 0; i < 32; ++i)
+                        wo[i] = 0.0h;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto xk = tx.slice(int(k), int(t0));
+            rop.run(xk, tr, acc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
     tensor<device float, dextents<int32_t, 2>, tensor_inline> ty(y, dextents<int32_t, 2>(a.n, a.t),
                                                                  array<int32_t, 2>{1, int32_t(a.ldy)});

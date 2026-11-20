@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 
@@ -46,6 +47,7 @@ TypeTraits traits(Type t)
     case Type::TQ2_0: return {"TQ2_0", 256, 66};
     case Type::MXFP4: return {"MXFP4", 32, 17};
     case Type::MXFP8: return {"MXFP8", 32, 33};
+    case Type::F8_E4M3: return {"F8_E4M3", 1, 1};
     }
     return {"?", 0, 0};
 }
@@ -210,6 +212,21 @@ std::expected<File, std::string> File::open(const std::string& path)
                 return std::unexpected(std::format("{}: tensor {} offset {} is not aligned", path, t.name, t.offset));
             if (__builtin_add_overflow(t.offset, f.data_offset_, &t.offset))
                 return std::unexpected(std::format("{}: tensor {} offset {} is past the file", path, t.name, t.offset));
+        }
+        // Type 43 whose data ends before MXFP8's size would but holds a byte per value: plain E4M3.
+        std::vector<uint64_t> starts;
+        for (const auto& t : f.tensors_)
+            starts.push_back(t.offset);
+        std::ranges::sort(starts);
+        for (auto& t : f.tensors_) {
+            if (t.type != Type::MXFP8)
+                continue;
+            const auto next = std::ranges::upper_bound(starts, t.offset);
+            const uint64_t room = (next == starts.end() ? f.size_ : *next) - t.offset;
+            if (room < t.bytes && room >= t.elements()) {
+                t.type = Type::F8_E4M3;
+                t.bytes = t.elements();
+            }
         }
     } catch (const ParseError& e) {
         return std::unexpected(path + ": " + e.msg);
