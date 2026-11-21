@@ -11,6 +11,7 @@ using namespace mpp::tensor_ops;
 #define GGML_COMMON_DECL_METAL
 #define GGML_COMMON_IMPL_METAL
 #include "ggml-common.h"
+#include "rows.h"
 
 // attn_pv's tile.
 constant int TM = 64, TN = 64, TK = 64;
@@ -283,6 +284,95 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
                                                                  array<int32_t, 2>{1, int32_t(a.ldy)});
     acc.store(ty.slice(n0, t0));
 }
+
+// The gate and up GEMMs of a SwiGLU FFN and the SwiGLU together: y[t][n] = half(silu(min(g, limit)) *
+// clamp(u, -limit, limit)) (limit <= 0: no clamp), g and u gemm's sums of wg's and wu's rows (the float math of the
+// swiglu kernel on gemm's outputs, without writing them). gemm's tiles, the 32 weight rows of one 16 rows of wg and
+// the same 16 of wu, so a threadgroup makes 16 outputs; grid (ceil(n / 16), ceil(t / TM)). k a multiple of the step
+// (256, IQ weights in tiles of up to 32 tokens 64).
+template <int Type, int TM>
+kernel void gemm_glu(device const uchar* wg [[buffer(0)]], device const half* x [[buffer(1)]], device half* y [[buffer(2)]],
+                     constant GemmArgs& a [[buffer(3)]], device const uchar* wu [[buffer(4)]],
+                     constant float& limit [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]],
+                     ushort tid [[thread_index_in_threadgroup]])
+{
+    constexpr bool iq = Type == IQ1_S || Type == IQ1_M || Type == IQ2_XXS || Type == IQ2_XS || Type == IQ2_S ||
+                        Type == IQ3_XXS || Type == IQ3_S;
+    constexpr int KD = iq && TM <= 32 ? 64 : 256, NSG = 4, TN = 32, H = TN / 2;
+    // The weight tiles, then the sums, up to 128 rows at a time (P x 32 floats).
+    constexpr int P = TM < 128 ? TM : 128, words = TN * KD / 2 > P * TN ? TN * KD / 2 : P * TN;
+    threadgroup float buf[words];
+    threadgroup half* ws = reinterpret_cast<threadgroup half*>(buf);
+    const uint n0 = tg.x * H, t0 = tg.y * TM;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device half*>(x), dextents<int32_t, 2>(a.k, a.t),
+                                                                array<int32_t, 2>{1, int32_t(a.ldx)});
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(KD, TN));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, KD, false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto mx = tx.slice(0, int(t0));
+    auto acc = op.template get_destination_cooperative_tensor<decltype(mx), decltype(tw), float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i))
+            acc[i] = 0.0f;
+    for (uint k = 0; k < a.k; k += KD) {
+        for (uint s = tid; s < TN * (KD / 32); s += NSG * 32) {
+            const uint r = s / (KD / 32), c = (s % (KD / 32)) * 32, row = n0 + r % H;
+            threadgroup half* wo = ws + r * KD + c;
+            if (row < a.n) {
+                dequant32<Type>((r < H ? wg : wu) + uint64_t(row) * a.row_bytes, k + c, wo);
+            } else {
+                for (short i = 0; i < 32; ++i)
+                    wo[i] = 0.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto xk = tx.slice(int(k), int(t0));
+        op.run(xk, tw, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint p0 = 0; p0 < uint(TM); p0 += P) {
+        for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+            if (!acc.is_valid_element(i))
+                continue;
+            const auto ix = acc.get_multidimensional_index(i);
+            if (uint(ix[1]) - p0 < uint(P))
+                buf[(ix[1] - p0) * TN + ix[0]] = acc[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < uint(P * H); i += NSG * 32) {
+            const uint r = p0 + i / H, j = i % H;
+            if (t0 + r >= a.t || n0 + j >= a.n)
+                continue;
+            float g = buf[(r - p0) * TN + j], u = buf[(r - p0) * TN + H + j];
+            if (limit > 0.0f) {
+                g = min(g, limit);
+                u = clamp(u, -limit, limit);
+            }
+            y[uint64_t(t0 + r) * a.ldy + n0 + j] = half(g * sigmoidf(g) * u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+#define GEMM_GLU(name, type, tm)                                                                                      \
+    template [[host_name("gemm_glu_" name "_" #tm "x32")]] kernel void gemm_glu<type, tm>(                           \
+        device const uchar*, device const half*, device half*, constant GemmArgs&, device const uchar*,               \
+        constant float&, uint2, ushort);
+#define GEMM_GLU_ALL(name, type) GEMM_GLU(name, type, 32) GEMM_GLU(name, type, 64) GEMM_GLU(name, type, 128)        \
+    GEMM_GLU(name, type, 256)
+#define GEMM_GLU_IQ(name, type) GEMM_GLU(name, type, 16) GEMM_GLU_ALL(name, type)
+GEMM_GLU_ALL("q8_0", Q8_0)
+GEMM_GLU_ALL("q6_k", Q6_K)
+GEMM_GLU_ALL("q5_k", Q5_K)
+GEMM_GLU_ALL("q4_k", Q4_K)
+GEMM_GLU_ALL("iq4_xs", IQ4_XS)
+GEMM_GLU_IQ("iq3_xxs", IQ3_XXS)
+GEMM_GLU_IQ("iq3_s", IQ3_S)
+GEMM_GLU_IQ("iq2_xxs", IQ2_XXS)
+GEMM_GLU_IQ("iq2_xs", IQ2_XS)
+GEMM_GLU_IQ("iq2_s", IQ2_S)
+GEMM_GLU_IQ("iq1_s", IQ1_S)
+GEMM_GLU_IQ("iq1_m", IQ1_M)
 
 // Dense weights of the activations' own type E (half or bfloat), rows of k E values: matmul2d reads both straight
 // from device memory, KD columns a step (no staging in threadgroup memory: 4096 tokens x 4096 -> 12288 -> 4096 BF16

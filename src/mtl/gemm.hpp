@@ -33,6 +33,14 @@ public:
     void encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                 const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* xh, uint64_t xh_off, const MTL::Buffer* y,
                 uint64_t y_off, uint32_t ldy = 0, uint32_t ldx = 0, bool direct = false, const Batch& batch = {});
+    // A SwiGLU FFN's gate and up GEMMs (weights wg and wu, both [n][k] of `type`) and the SwiGLU in one dispatch:
+    // y[t][n] = half(silu(min(g, limit)) * clamp(u, -limit, limit)) (limit <= 0: no clamp), the staged kernels' sums
+    // and the swiglu kernel's math. Where supports_glu(type, k).
+    static bool supports_glu(gguf::Type type, uint32_t k);
+    void encode_glu(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
+                    const MTL::Buffer* wg, uint64_t wg_off, const MTL::Buffer* wu, uint64_t wu_off,
+                    const MTL::Buffer* xh, uint64_t xh_off, const MTL::Buffer* y, uint64_t y_off, float limit,
+                    uint32_t ldy = 0, uint32_t ldx = 0);
     // xh = half(x) as dense rows of `cols`; x rows are ldx floats apart (0: cols).
     void to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                  uint32_t ldx, const MTL::Buffer* xh, uint64_t xh_off);
