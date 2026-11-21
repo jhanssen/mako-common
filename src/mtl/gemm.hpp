@@ -13,6 +13,12 @@ namespace mako::mtl {
 // multiple of 32. BF16 weights take x in bfloat, both read straight from device memory; k a multiple of 64. I8
 // weights (int8 rows with a float scale each after the rows, quantize_i8()'s layout) take x the same way, the sums
 // exact in int32; k a multiple of 128.
+// count matrices in one GEMM dispatch (the staged kernels only): matrix m's weights w_mat bytes, its x x_mat halves
+// and its y y_mat floats after matrix 0's.
+struct GemmBatch {
+    uint32_t count = 1, w_mat = 0, x_mat = 0, y_mat = 0;
+};
+
 class Gemm {
 public:
     explicit Gemm(const Context& ctx);
@@ -21,11 +27,12 @@ public:
     // Up to this many tokens, IQ2_XXS, IQ2_S and IQ3_XXS weights use the few-token kernel (0: never).
     void set_few_tokens(uint32_t t) { few_tokens_ = t; }
 
+    using Batch = GemmBatch;
     // y rows are ldy elements apart (0: n), x rows ldx (0: k); offsets in bytes.
     // direct: F16 weights read as BF16's are (k a multiple of 64), not staged; the sums come out in another order.
     void encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                 const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* xh, uint64_t xh_off, const MTL::Buffer* y,
-                uint64_t y_off, uint32_t ldy = 0, uint32_t ldx = 0, bool direct = false);
+                uint64_t y_off, uint32_t ldy = 0, uint32_t ldx = 0, bool direct = false, const Batch& batch = {});
     // xh = half(x) as dense rows of `cols`; x rows are ldx floats apart (0: cols).
     void to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows, uint32_t cols,
                  uint32_t ldx, const MTL::Buffer* xh, uint64_t xh_off);

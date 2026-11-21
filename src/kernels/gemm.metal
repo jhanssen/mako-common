@@ -19,6 +19,9 @@ struct GemmArgs {
     uint t, k, n, row_bytes;
     uint ldy; // y row stride in elements
     uint ldx; // x row stride in elements
+    // gemm only: batch > 1 matrices, grid y t_tiles a matrix; matrix m's weights w_mat bytes, x x_mat and y y_mat
+    // elements after matrix 0's
+    uint batch, t_tiles, w_mat, x_mat, y_mat;
 };
 
 enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9, IQ4_XS = 10, IQ2_XS = 11, IQ1_S = 12, IQ1_M = 13 };
@@ -214,7 +217,15 @@ kernel void gemm(device const uchar* w [[buffer(0)]], device const half* x [[buf
                         Type == IQ3_XXS || Type == IQ3_S;
     constexpr int KD = iq && TM <= 32 ? 64 : 256, NSG = 4;
     threadgroup half ws[TN * KD];
-    const uint n0 = tg.x * TN, t0 = tg.y * TM;
+    uint ty0 = tg.y;
+    if (a.batch > 1) {
+        const uint m = ty0 / a.t_tiles;
+        ty0 %= a.t_tiles;
+        w += uint64_t(m) * a.w_mat;
+        x += uint64_t(m) * a.x_mat;
+        y += uint64_t(m) * a.y_mat;
+    }
+    const uint n0 = tg.x * TN, t0 = ty0 * TM;
     tensor<device half, dextents<int32_t, 2>, tensor_inline> tx(const_cast<device half*>(x), dextents<int32_t, 2>(a.k, a.t),
                                                                 array<int32_t, 2>{1, int32_t(a.ldx)});
     tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tw(ws, dextents<int32_t, 2>(KD, TN));

@@ -12,6 +12,7 @@ namespace {
 // Layout must match GemmArgs in gemm.metal.
 struct GemmArgs {
     uint32_t t, k, n, row_bytes, ldy, ldx;
+    uint32_t batch = 1, t_tiles = 0, w_mat = 0, x_mat = 0, y_mat = 0;
 };
 
 const char* kernel_name(gguf::Type type)
@@ -63,13 +64,16 @@ MTL::ComputePipelineState* Gemm::pso(const std::string& name)
 
 void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, uint32_t n, uint32_t t,
                   const MTL::Buffer* w, uint64_t w_off, const MTL::Buffer* xh, uint64_t xh_off, const MTL::Buffer* y,
-                  uint64_t y_off, uint32_t ldy, uint32_t ldx, bool direct)
+                  uint64_t y_off, uint32_t ldy, uint32_t ldx, bool direct, const Batch& batch)
 {
+    if (batch.count > 1 && (type == gguf::Type::I8 || type == gguf::Type::BF16 || direct ||
+                            (few_name(type) && t <= few_tokens_)))
+        throw std::runtime_error("batched GEMM: only the staged kernels");
     const char* name = kernel_name(type);
     if (!name || k % 32)
         throw std::runtime_error(std::format("no GEMM for {} with k={}", gguf::traits(type).name, k));
     const auto tr = gguf::traits(type);
-    const GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes), ldy ? ldy : n, ldx ? ldx : k};
+    GemmArgs a{t, k, n, uint32_t(uint64_t(k) / tr.block_elems * tr.block_bytes), ldy ? ldy : n, ldx ? ldx : k};
     if (const char* few = few_name(type); few && t <= few_tokens_) {
         // Weights dequantized once per pass of up to 4 tokens, in registers; 16 rows per threadgroup.
         const uint32_t nt = t <= 1 ? 1 : t <= 2 ? 2 : 4;
@@ -122,12 +126,20 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
         tm = 128;
     if (t > 128 && (t + 255) / 256 * 256 <= (t + 127) / 128 * 128)
         tm = 256;
+    const uint32_t tiles = (t + tm - 1) / tm;
+    if (batch.count > 1) {
+        a.batch = batch.count;
+        a.t_tiles = tiles;
+        a.w_mat = batch.w_mat;
+        a.x_mat = batch.x_mat;
+        a.y_mat = batch.y_mat;
+    }
     enc->setComputePipelineState(pso(std::format("{}_{}x{}", name, tm, tn)));
     enc->setBuffer(w, w_off, 0);
     enc->setBuffer(xh, xh_off, 1);
     enc->setBuffer(y, y_off, 2);
     enc->setBytes(&a, sizeof(a), 3);
-    enc->dispatchThreadgroups(MTL::Size((n + tn - 1) / tn, (t + tm - 1) / tm, 1), MTL::Size(128, 1, 1));
+    enc->dispatchThreadgroups(MTL::Size((n + tn - 1) / tn, tiles * std::max(1u, batch.count), 1), MTL::Size(128, 1, 1));
 }
 
 void Gemm::to_bf16(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
