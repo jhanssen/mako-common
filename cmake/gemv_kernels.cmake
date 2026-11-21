@@ -10,5 +10,6 @@ add_custom_command(
     COMMAND xcrun -sdk macosx metallib ${CMAKE_BINARY_DIR}/gemv.air -o ${GEMV_METALLIB}
     DEPENDS ${GEMV_KERNELS_DIR}/mul_mv.metal ${MAKO_COMMON_DIR}/src/kernels/gemv_slots.metal
             ${MAKO_COMMON_DIR}/src/kernels/moe_route.h ${MAKO_COMMON_DIR}/src/kernels/iq_grids_half.h
+            ${MAKO_COMMON_DIR}/src/kernels/args.h
     COMMENT "Compiling reference GEMV kernels")
 add_custom_target(gemv_metallib DEPENDS ${GEMV_METALLIB})

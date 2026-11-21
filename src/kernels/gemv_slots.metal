@@ -2,6 +2,7 @@
 // lendable slots). Otherwise as the per-format indexed GEMV it wraps.
 #include "mul_mv.metal"
 #include "iq_grids_half.h"
+#include "args.h"
 
 template <mul_mv_disp_fn_t disp_fn>
 kernel void mako_mul_mv_slots(constant ggml_metal_kargs_mul_mv_id& args, device const char* src0s,
@@ -756,27 +757,6 @@ void mako_iq2_xs_impl(args_t args, device const char* src0, device const char* s
 // resident); each job runs its format's kernel over its threadgroups, 4 simdgroups a threadgroup: the K-splitting
 // kernels (Q8_0, F32) as always, the row-per-simdgroup ones with twice the rows a threadgroup, each row's sum as
 // before. An indexed job looks each matrix up in slot ids as the slots kernel does.
-struct GemvJob {
-    device const char* w;     // weights: matrix 0 / slot 0
-    device const char* x;     // activations: token 0, matrix 0
-    device char* y;           // outputs: token 0, matrix 0
-    device const int* ids;    // indexed: the slot ids (a row per token); null otherwise
-    device const char* w_tail; // indexed: the slots from `split` on
-    uint64_t nb02;            // bytes between matrices or slots
-    uint64_t nb01;            // bytes between rows
-    uint64_t x_tok, x_mat;    // bytes between tokens' / matrices' x rows (x_mat 0: shared)
-    uint64_t y_tok, y_mat;    // bytes between tokens' / matrices' y rows
-    uint ids_stride;          // elements between tokens' id rows
-    uint split;
-    uint type;                // JobType
-    uint k, n, nr0;
-    uint tg0, tgs_x;          // first threadgroup; threadgroups per matrix
-    uint nb00;                // block bytes
-};
-enum JobType : uint {
-    JOB_Q6_K = 0, JOB_Q8_0 = 1, JOB_F32_4 = 2, JOB_IQ2_XXS = 3, JOB_IQ3_XXS = 4, JOB_IQ2_S = 5, JOB_IQ3_S = 6,
-    JOB_Q5_K = 7, JOB_IQ2_XS = 8, JOB_IQ1_S = 9, JOB_IQ1_M = 10, JOB_IQ4_XS = 11,
-};
 
 kernel void mako_mul_mv_jobs(constant GemvJob* jobs [[buffer(0)]], constant uint& njobs [[buffer(1)]],
                              threadgroup char* shmem [[threadgroup(0)]], uint3 tgpig [[threadgroup_position_in_grid]],

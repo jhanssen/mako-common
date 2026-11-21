@@ -1,6 +1,7 @@
 #include "models/conv.hpp"
 
 #include "gguf/read_pool.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <cstring>
@@ -10,9 +11,10 @@ namespace mako::models {
 
 namespace {
 
-struct Im2colArgs {
-    uint32_t h, w, c, p0, rows, kpad, mode;
-};
+using kernels::GnArgs;
+using kernels::Im2col3dArgs;
+using kernels::Im2colArgs;
+using kernels::Im2colS2Args;
 
 } // namespace
 
@@ -112,10 +114,11 @@ void ConvRuntime::conv3d(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::B
         for (uint32_t p0 = 0; p0 < rows; p0 += chunk) {
             const uint32_t n = std::min(chunk, rows - p0);
             // The first time tap reads frame to * ts - 2 (negative: the causal zero padding).
-            const int32_t a[12] = {int32_t(h), int32_t(w), int32_t(c.cin), int32_t(p0), int32_t(n), int32_t(c.kpad),
-                                   int32_t(c.mode), int32_t(ow), int32_t(c.stride), int32_t(c.stride == 2 ? c.pad : 1),
-                                   int32_t(to * ts) - 2, int32_t(T)};
-            dispatch(enc, "im2col3d", {x, col}, a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
+            const Im2col3dArgs a{int32_t(h),      int32_t(w),        int32_t(c.cin),
+                                 int32_t(p0),     int32_t(n),        int32_t(c.kpad),
+                                 int32_t(c.mode), int32_t(ow),       int32_t(c.stride),
+                                 int32_t(c.stride == 2 ? c.pad : 1), int32_t(to * ts) - 2, int32_t(T)};
+            dispatch(enc, "im2col3d", {x, col}, &a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
             gemm_->encode(enc, gguf::Type::F16, c.kpad, c.cout, n, c.w.buf, c.w.off, col, 0, y,
                           (uint64_t(to) * rows + p0) * c.cout * 4, 0, 0, true);
             after(enc, "conv3x3x3");
@@ -133,8 +136,8 @@ void ConvRuntime::conv(MTL::ComputeCommandEncoder*& enc, const Conv& c, MTL::Buf
         MTL::Buffer* col = scratch("v_col", uint64_t(std::min(chunk, rows)) * c.kpad * 2);
         for (uint32_t p0 = 0; p0 < rows; p0 += chunk) {
             const uint32_t n = std::min(chunk, rows - p0);
-            const uint32_t a[9] = {h, w, c.cin, p0, n, c.kpad, ow, c.pad, uint32_t(c.mode)};
-            dispatch(enc, "im2col3x3_s2", {x, col}, a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
+            const Im2colS2Args a{h, w, c.cin, p0, n, c.kpad, ow, c.pad, uint32_t(c.mode)};
+            dispatch(enc, "im2col3x3_s2", {x, col}, &a, sizeof(a), MTL::Size(c.kpad, n, 1), MTL::Size(256, 1, 1));
             gemm_->encode(enc, gguf::Type::F16, c.kpad, c.cout, n, c.w.buf, c.w.off, col, 0, y,
                           uint64_t(p0) * c.cout * 4, 0, 0, true);
             after(enc, "conv3x3_s2");
@@ -174,11 +177,7 @@ void ConvRuntime::group_norm(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* x, c
                              MTL::Buffer* y, uint32_t rows, uint32_t c, bool silu, float eps, uint64_t x_off,
                              uint64_t y_off)
 {
-    struct {
-        uint32_t rows, c, groups, chunk;
-        float eps;
-        uint32_t silu;
-    } a{rows, c, 32, 256, eps, silu ? 1u : 0u};
+    const GnArgs a{rows, c, 32, 256, eps, silu ? 1u : 0u};
     const uint32_t chunks = (rows + a.chunk - 1) / a.chunk;
     MTL::Buffer* part = scratch("gn_part", uint64_t(chunks) * c * 8);
     MTL::Buffer* stats = scratch("gn_stats", 32 * 8);

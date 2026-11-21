@@ -1,6 +1,7 @@
 #include "mtl/gemv.hpp"
 
 #include "mtl/embedded.hpp"
+#include "kernels/args.h"
 
 #include <format>
 #include <string_view>
@@ -90,35 +91,28 @@ bool is_iq(gguf::Type t)
 }
 
 // Layout must match ShortArgs in gemv.metal.
-struct ShortArgs {
-    uint32_t k, n, row_bytes, tokens;
-};
+using kernels::ShortArgs;
 
-// Layout must match GemvJob in gemv_slots.metal (pointers as GPU addresses).
-struct JobRow {
-    uint64_t w, x, y, ids, w_tail;
-    uint64_t nb02, nb01, x_tok, x_mat, y_tok, y_mat;
-    uint32_t ids_stride, split, type, k, n, nr0, tg0, tgs_x, nb00;
-};
-static_assert(sizeof(JobRow) == 128);
+using kernels::GemvJob;
+using kernels::ShortBatchArgs;
 
 // The job kernel's type code, rows per simdgroup and rows per threadgroup (4 simdgroups), or -1.
 int job_type(gguf::Type t, int& nr0, int& rows_per_tg)
 {
     using gguf::Type;
     switch (t) {
-    case Type::Q6_K: nr0 = 2, rows_per_tg = 8; return 0;
-    case Type::Q8_0: nr0 = 2, rows_per_tg = 2; return 1;  // the simdgroups split K
-    case Type::F32: nr0 = 2, rows_per_tg = 2; return 2;   // the same
-    case Type::IQ2_XXS: nr0 = 4, rows_per_tg = 16; return 3;
-    case Type::IQ3_XXS: nr0 = 4, rows_per_tg = 16; return 4;
-    case Type::IQ2_S: nr0 = 4, rows_per_tg = 16; return 5;
-    case Type::IQ3_S: nr0 = 4, rows_per_tg = 16; return 6;
-    case Type::Q5_K: nr0 = 1, rows_per_tg = 4; return 7;
-    case Type::IQ2_XS: nr0 = 4, rows_per_tg = 16; return 8;
-    case Type::IQ1_S: nr0 = 4, rows_per_tg = 16; return 9;
-    case Type::IQ1_M: nr0 = 4, rows_per_tg = 16; return 10;
-    case Type::IQ4_XS: nr0 = 2, rows_per_tg = 8; return 11;
+    case Type::Q6_K: nr0 = 2, rows_per_tg = 8; return kernels::JOB_Q6_K;
+    case Type::Q8_0: nr0 = 2, rows_per_tg = 2; return kernels::JOB_Q8_0; // the simdgroups split K
+    case Type::F32: nr0 = 2, rows_per_tg = 2; return kernels::JOB_F32_4;  // the same
+    case Type::IQ2_XXS: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ2_XXS;
+    case Type::IQ3_XXS: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ3_XXS;
+    case Type::IQ2_S: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ2_S;
+    case Type::IQ3_S: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ3_S;
+    case Type::Q5_K: nr0 = 1, rows_per_tg = 4; return kernels::JOB_Q5_K;
+    case Type::IQ2_XS: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ2_XS;
+    case Type::IQ1_S: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ1_S;
+    case Type::IQ1_M: nr0 = 4, rows_per_tg = 16; return kernels::JOB_IQ1_M;
+    case Type::IQ4_XS: nr0 = 2, rows_per_tg = 8; return kernels::JOB_IQ4_XS;
     default: return -1;
     }
 }
@@ -159,11 +153,7 @@ bool Gemv::encode_short_batch(MTL::ComputeCommandEncoder* enc, const Args& a, co
     if (!own_kernels_ || (!q8 && a.type != gguf::Type::F32) || a.batch == 0 || a.t == 0 || a.t > 8 || a.k % 32 ||
         a.k > 512)
         return false;
-    struct {
-        uint32_t k, n, row_bytes, tokens;
-        uint64_t w_mat;
-        uint32_t x_tok, x_mat, y_tok, y_mat;
-    } sa{a.k, a.n, uint32_t(row_bytes(a.type, a.k)), a.t, s.w_mat, s.x_tok, s.x_mat, s.y_tok, s.y_mat};
+    const ShortBatchArgs sa{a.k, a.n, uint32_t(row_bytes(a.type, a.k)), a.t, s.w_mat, s.x_tok, s.x_mat, s.y_tok, s.y_mat};
     enc->setComputePipelineState(own(q8 ? "gemv_short_batch_q8_0" : "gemv_short_batch_f32"));
     enc->setBuffer(w, w_off, 0);
     enc->setBuffer(x, x_off, 1);
@@ -382,7 +372,7 @@ void Gemv::encode_jobs(MTL::ComputeCommandEncoder* enc, std::span<const Job> job
         fc->setConstantValue(&split, MTL::DataTypeBool, 605);
         jobs_pso_ = ctx_.pipeline(lib_.get(), "mako_mul_mv_jobs", fc.get());
     }
-    auto* rows = reinterpret_cast<JobRow*>(static_cast<char*>(table->contents()) + table_off);
+    auto* rows = reinterpret_cast<GemvJob*>(static_cast<char*>(table->contents()) + table_off);
     const uint32_t T = jobs[0].a.t;
     uint32_t tg = 0;
     for (size_t i = 0; i < jobs.size(); ++i) {
@@ -393,7 +383,7 @@ void Gemv::encode_jobs(MTL::ComputeCommandEncoder* enc, std::span<const Job> job
         if (type < 0 || a.t != T || !job_supported(a))
             throw std::runtime_error("GEMV job not supported");
         const uint64_t rb = a.type == gguf::Type::F32 ? uint64_t(a.k) * 4 : row_bytes(a.type, a.k);
-        JobRow r{};
+        GemvJob r{};
         r.w = j.w->gpuAddress() + j.w_off;
         r.x = j.x->gpuAddress() + j.x_off;
         r.y = j.y->gpuAddress() + j.y_off;

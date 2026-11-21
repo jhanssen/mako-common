@@ -1,6 +1,7 @@
 // Pieces shared by row kernels: threadgroups of TG threads, their sums, the sigmoid and the RMS norm's arguments.
 #pragma once
 #include <metal_stdlib>
+#include "args.h"
 using namespace metal;
 
 constant uint TG = 256;
@@ -21,9 +22,3 @@ constant uint TG = 256;
 
 [[maybe_unused]] static float sigmoidf(float x) { return 1.0f / (1.0f + exp(-x)); }
 
-struct NormArgs {
-    uint n;       // row length
-    uint wn;      // weight length (the weight repeats every wn elements); 0: no weight
-    float eps;
-    uint ystride; // rms_norm: y row stride in elements (0: n)
-};

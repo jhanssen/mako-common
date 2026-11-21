@@ -1,11 +1,8 @@
 // GEMV kernels for shapes the per-format kernels handle poorly; fp32 activations.
 #include <metal_stdlib>
+#include "args.h"
 using namespace metal;
 
-struct ShortArgs {
-    uint k, n, row_bytes;
-    uint tokens; // 1..8: x rows of k, y rows of n
-};
 
 // Short rows (k <= 512), which the per-format kernels spread over 32 lanes per row and leave mostly idle: four
 // lanes per row, x staged in threadgroup memory, each weight read once for all the tokens. Threadgroups of 256
@@ -58,13 +55,6 @@ template [[host_name("gemv_short_f32")]] kernel void gemv_short<false>(device co
 template [[host_name("gemv_short_q8_0")]] kernel void gemv_short<true>(device const uchar*, device const float*,
                                                                        device float*, constant ShortArgs&, uint, uint);
 
-struct ShortBatchArgs {
-    uint k, n, row_bytes;
-    uint tokens;              // 1..8
-    uint64_t w_mat;           // bytes between matrices
-    uint x_tok, x_mat;        // floats between tokens' / matrices' x rows
-    uint y_tok, y_mat;        // floats between tokens' / matrices' y rows
-};
 
 // gemv_short over a batch of matrices (threadgroup rows y: the matrix), each with its own x rows: per-head
 // projections of several tokens laid out token by token. Each row's sums as gemv_short forms them.

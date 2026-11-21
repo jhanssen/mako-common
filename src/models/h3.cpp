@@ -2,6 +2,7 @@
 
 #include "gguf/read_pool.hpp"
 #include "log/log.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <cmath>
@@ -14,14 +15,8 @@ namespace mako::models {
 
 namespace {
 
-struct RowModArgs {
-    uint32_t n;
-    float eps;
-    uint32_t shift_off, scale_off;
-};
-struct GateRowsArgs {
-    uint32_t n, gate_off;
-};
+using kernels::RowModArgs;
+using kernels::GateRowsArgs;
 
 constexpr float kEps = 1e-5f;
 constexpr uint32_t kFfn = 14336, kQkv = 3 * H3::kHeads * 128, kAdaln = 6 * 3 * H3::kDim, kModality = 6 * H3::kDim;

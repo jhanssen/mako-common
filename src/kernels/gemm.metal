@@ -12,18 +12,11 @@ using namespace mpp::tensor_ops;
 #define GGML_COMMON_IMPL_METAL
 #include "ggml-common.h"
 #include "rows.h"
+#include "args.h"
 
 // attn_pv's tile.
 constant int TM = 64, TN = 64, TK = 64;
 
-struct GemmArgs {
-    uint t, k, n, row_bytes;
-    uint ldy; // y row stride in elements
-    uint ldx; // x row stride in elements
-    // gemm only: batch > 1 matrices, grid y t_tiles a matrix; matrix m's weights w_mat bytes, x x_mat and y y_mat
-    // elements after matrix 0's
-    uint batch, t_tiles, w_mat, x_mat, y_mat;
-};
 
 enum WeightType { F32 = 0, Q8_0 = 1, Q6_K = 2, IQ2_XXS = 3, IQ2_S = 4, IQ3_XXS = 5, F16 = 6, IQ3_S = 7, Q4_K = 8, Q5_K = 9, IQ4_XS = 10, IQ2_XS = 11, IQ1_S = 12, IQ1_M = 13 };
 
@@ -476,9 +469,6 @@ template [[host_name("gemm_i8_128x128")]] kernel void gemm_i8<128, 128, 8, 128>(
 // Rows of x (float or bfloat, ldx elements apart) to int8 with a scale each: q[r][c] = rint(x[r][c] / s_r),
 // s_r = max |x[r]| / 127 (an all-zero row: 1 / 127), the scales as floats after the rows at q + rows * cols, which
 // is what gemm_i8 reads. One threadgroup of 256 per row; cols a multiple of 4.
-struct QuantArgs {
-    uint cols, ldx, rows;
-};
 template <typename T>
 kernel void quant_rows_i8(device const T* x [[buffer(0)]], device int8_t* q [[buffer(1)]],
                           constant QuantArgs& a [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
@@ -789,9 +779,6 @@ template [[host_name("gemm_f16_32x32")]] kernel void gemm<F16, 32, 32>(device co
 
 
 // y[r][c] = half(x[r * ldx + c]), dense rows of `cols`; grid (cols, rows).
-struct HalfArgs {
-    uint cols, ldx;
-};
 kernel void to_half(device const float* x [[buffer(0)]], device half* y [[buffer(1)]], constant HalfArgs& a [[buffer(2)]],
                     uint2 gid [[thread_position_in_grid]])
 {
@@ -806,10 +793,6 @@ kernel void to_bf16(device const float* x [[buffer(0)]], device bfloat* y [[buff
         y[uint64_t(gid.y) * a.cols + gid.x] = bfloat(x[uint64_t(gid.y) * a.ldx + gid.x]);
 }
 
-struct PvArgs {
-    uint heads, dim, n_kv;
-    uint keys_per_split; // a multiple of 64
-};
 
 // Attention output for one query position over a shared latent cache, split over keys:
 // partial[split][h][d] = sum over the split's keys t of p[h][t] * kv[t][d]. Threadgroups (dim / 64,
@@ -857,13 +840,6 @@ kernel void attn_pv(device const float* p [[buffer(0)]], device const half* kv [
 
 // Sparse attention over a shared half latent cache: each query token attends to the cache rows in its own index list
 // (list rows of `stride` entries, count[t] used), so the work per token is bounded by the list, not the context.
-struct GatherArgs {
-    uint heads;  // query rows per token
-    uint dim;    // latent width (multiple of 256)
-    uint stride; // list and score row length
-    uint splits; // attn_gather_pv: key ranges per token
-    uint tokens; // attn_gather_pv: partial is [splits][tokens][heads][dim]
-};
 
 // scores[t][h][s] = q[t][h] . kv[list[t][s]]; grid (ceil(stride / 32), 1, tokens), 4 simdgroups; heads <= 64.
 kernel void attn_gather_scores(device const half* q [[buffer(0)]], device const half* kv [[buffer(1)]],
@@ -971,10 +947,6 @@ kernel void attn_gather_pv(device const float* p [[buffer(0)]], device const hal
 // Indexer dot products for consecutive tokens: dots[t][h][p] = q[t][h] . pooled[p] in float (matmul2d float x float),
 // over the pools token 0 can see and beyond (the reduction stops at each token's own count). Grid (ceil(pools / 64),
 // 1, tokens), 4 simdgroups; heads <= 32 (padded to 32 rows), dim the reduction length.
-struct IdxDotArgs {
-    uint heads, dim, pools; // pools: of the last token
-    uint stride;            // dots row length
-};
 kernel void idx_dots(device const float* q [[buffer(0)]], device const float* pooled [[buffer(1)]],
                      device float* dots [[buffer(2)]], constant IdxDotArgs& a [[buffer(3)]],
                      uint3 tg [[threadgroup_position_in_grid]])

@@ -2,6 +2,7 @@
 
 #include "gguf/read_pool.hpp"
 #include "mtl/embedded.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -20,15 +21,8 @@ constexpr uint64_t kAlign = 256;
 constexpr uint64_t kChunkBytes = 1ull << 30;
 constexpr NS::UInteger kSamplesPerBuffer = 4096; // the largest counter sample buffer is 32 KiB
 
-struct NormArgs {
-    uint32_t n, wn;
-    float eps;
-    uint32_t ystride;
-};
-struct SwigluArgs {
-    uint32_t n;
-    float limit;
-};
+using kernels::NormArgs;
+using kernels::SwigluArgs;
 
 } // namespace
 

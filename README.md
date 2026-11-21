@@ -13,8 +13,10 @@ The code [mako](https://github.com/jhanssen/mako) (LLM inference) and
 - `memory`: lending GPU memory between two processes on one machine (`memory/lender.hpp` describes the protocol)
 
 A program builds its kernels with `mako_add_kernels(<target> SOURCES <its .metal files>)` (`cmake/mako_kernels.cmake`):
-one metallib of the common kernels and its own, linked as the object library `<target>`. Third-party llama.cpp files
-a project needs besides the GEMV kernels go in `MAKO_LLAMA_CPP_EXTRA_FILES` before `add_subdirectory`.
+one metallib of the common kernels and its own, linked as the object library `<target>`. The common kernels' argument
+structs are in `src/kernels/args.h`, which both the kernels and the C++ that dispatches them include (C++:
+`mako::kernels`); a program uses those, not copies of them. Third-party llama.cpp files a project needs besides the
+GEMV kernels go in `MAKO_LLAMA_CPP_EXTRA_FILES` before `add_subdirectory`.
 
 ## Build and test
 

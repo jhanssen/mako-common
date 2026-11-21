@@ -1,6 +1,7 @@
 #include "models/h3_vae.hpp"
 
 #include "log/log.hpp"
+#include "kernels/args.h"
 
 #include <glaze/glaze.hpp>
 
@@ -18,11 +19,7 @@ namespace mako::models {
 
 namespace {
 
-struct LayerNormArgs {
-    uint32_t n;
-    float eps;
-    uint32_t ystride = 0;
-};
+using kernels::LayerNormArgs;
 
 constexpr float kEps = 1e-5f, kRopeTheta = 100.0f;
 constexpr uint32_t kEmbedCols = 32; // the 24 latent channels padded for the GEMM

@@ -1,13 +1,7 @@
 // Router top-k for one token, shared by the moe_route kernel and the router GEMV that routes in its last threadgroup.
 #pragma once
+#include "args.h"
 
-struct RouteArgs {
-    uint n_expert, n_used, norm;
-    float scale;
-    uint lookup; // 1: look the selection up in slots (one token); 2: also count it in `counts`
-    uint score;  // 0: sigmoid, 1: sqrt(softplus)
-    float miss_penalty; // > 0: subtracted from the selection score (not the weight) of an expert slots lacks
-};
 
 static float route_score(float l, uint kind)
 {

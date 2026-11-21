@@ -1,6 +1,7 @@
 #include "mtl/gemm.hpp"
 
 #include "mtl/embedded.hpp"
+#include "kernels/args.h"
 
 #include <array>
 #include <format>
@@ -11,10 +12,9 @@ namespace mako::mtl {
 namespace {
 
 // Layout must match GemmArgs in gemm.metal.
-struct GemmArgs {
-    uint32_t t, k, n, row_bytes, ldy, ldx;
-    uint32_t batch = 1, t_tiles = 0, w_mat = 0, x_mat = 0, y_mat = 0;
-};
+using kernels::GemmArgs;
+using kernels::HalfArgs;
+using kernels::QuantArgs;
 
 const char* kernel_name(gguf::Type type)
 {
@@ -274,11 +274,11 @@ void Gemm::encode(MTL::ComputeCommandEncoder* enc, gguf::Type type, uint32_t k, 
 void Gemm::to_bf16(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
                    uint32_t cols, uint32_t ldx, const MTL::Buffer* xb, uint64_t xb_off)
 {
-    const uint32_t a[2] = {cols, ldx ? ldx : cols};
+    const HalfArgs a{cols, ldx ? ldx : cols};
     enc->setComputePipelineState(pso("to_bf16"));
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(xb, xb_off, 1);
-    enc->setBytes(a, sizeof(a), 2);
+    enc->setBytes(&a, sizeof(a), 2);
     enc->dispatchThreads(MTL::Size(cols, rows, 1), MTL::Size(256, 1, 1));
 }
 
@@ -287,22 +287,22 @@ void Gemm::quantize_i8(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, ui
 {
     if (cols % 4)
         throw std::runtime_error(std::format("quantize_i8: {} columns are not a multiple of 4", cols));
-    const uint32_t a[3] = {cols, ldx ? ldx : cols, rows};
+    const QuantArgs a{cols, ldx ? ldx : cols, rows};
     enc->setComputePipelineState(pso(from_bf16 ? "quant_rows_i8_bf16" : "quant_rows_i8_f32"));
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(q, q_off, 1);
-    enc->setBytes(a, sizeof(a), 2);
+    enc->setBytes(&a, sizeof(a), 2);
     enc->dispatchThreadgroups(MTL::Size(rows, 1, 1), MTL::Size(256, 1, 1));
 }
 
 void Gemm::to_half(MTL::ComputeCommandEncoder* enc, const MTL::Buffer* x, uint64_t x_off, uint32_t rows,
                    uint32_t cols, uint32_t ldx, const MTL::Buffer* xh, uint64_t xh_off)
 {
-    const uint32_t a[2] = {cols, ldx ? ldx : cols};
+    const HalfArgs a{cols, ldx ? ldx : cols};
     enc->setComputePipelineState(pso("to_half"));
     enc->setBuffer(x, x_off, 0);
     enc->setBuffer(xh, xh_off, 1);
-    enc->setBytes(a, sizeof(a), 2);
+    enc->setBytes(&a, sizeof(a), 2);
     enc->dispatchThreads(MTL::Size(cols, rows, 1), MTL::Size(256, 1, 1));
 }
 

@@ -1,6 +1,7 @@
 #include "models/runtime.hpp"
 
 #include "log/log.hpp"
+#include "kernels/args.h"
 
 #include <glaze/glaze.hpp>
 
@@ -15,10 +16,7 @@ namespace mako::models {
 
 namespace {
 
-struct LoraArgs {
-    uint32_t k, rows, rank, b_rot;
-    float scale;
-};
+using kernels::LoraArgs;
 
 } // namespace
 

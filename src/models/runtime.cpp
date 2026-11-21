@@ -1,6 +1,7 @@
 #include "models/runtime.hpp"
 
 #include "gguf/read_pool.hpp"
+#include "kernels/args.h"
 
 #include <cmath>
 #include <cstring>
@@ -11,23 +12,10 @@ namespace mako::models {
 
 namespace {
 
-struct HeadsArgs {
-    uint32_t rows, ld, col0, dim, n_pad, row0, rope;
-};
-struct HeadsNormArgs {
-    uint32_t ld, col0, dim, n_pad, row0, rope;
-    float eps;
-};
-struct HeadsPartialArgs {
-    uint32_t ld, col0, stride, dim, rot, n_pad;
-    float eps;
-    uint32_t mapped;
-};
-struct AttnArgs {
-    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
-    float scale;
-    uint32_t limits = 0; // 1: per-query key limits in buffer 5
-};
+using kernels::HeadsArgs;
+using kernels::HeadsNormArgs;
+using kernels::HeadsPartialArgs;
+using kernels::AttnArgs;
 
 uint16_t to_bf16(float f)
 {
@@ -283,14 +271,8 @@ void TransformerRuntime::attention(MTL::ComputeCommandEncoder*& enc, MTL::Buffer
 }
 
 namespace {
-struct CubeArgs {
-    uint32_t n_cubes, k_pad, dim, topk, local, stride;
-};
-struct SparseAttnArgs {
-    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, width;
-    float scale;
-    uint32_t n_cubes, max_sel, dense0, dense1;
-};
+using kernels::CubeArgs;
+using kernels::SparseAttnArgs;
 } // namespace
 
 void TransformerRuntime::cube_select(MTL::ComputeCommandEncoder*& enc, MTL::Buffer* q, MTL::Buffer* k, uint32_t heads,

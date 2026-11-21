@@ -7,16 +7,8 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 #include "rows.h"
+#include "args.h"
 
-struct HeadsArgs {
-    uint rows;     // tokens
-    uint ld;       // x row stride in elements
-    uint col0;     // the first head's column
-    uint dim;      // per head
-    uint n_pad;    // rows of a head in y
-    uint row0;     // y row of token 0
-    uint rope;     // 0 none; 1 halves (i with i + dim/2); 2 adjacent pairs (2i with 2i + 1)
-};
 
 // y[h][row0 + t][d] = half(x[t][col0 + h * dim + d]), rotated by the angle table cs[t][i] = (cos, sin) of pair i when
 // rope is set. Grid (dim / 2, rows, heads).
@@ -51,18 +43,6 @@ kernel void heads_clear(device half* y [[buffer(0)]], constant uint4& a [[buffer
         y[(uint64_t(h) * n_pad + t) * dim + d] = 0.0h;
 }
 
-struct AttnArgs {
-    uint n_q;      // queries
-    uint q_pad;    // rows of a query head (a multiple of 32)
-    uint n_k;      // keys
-    uint k_pad;    // rows of a key / value head (a multiple of 128)
-    uint heads, kv_heads;
-    uint q_pos0;   // the position of query 0 among the keys
-    uint block;    // positions from here on see each other both ways (the image); below, causal
-    uint width;    // o row length
-    float scale;
-    uint limits;   // 1: query position p sees the keys before limits[p] instead (buffer 5, non-decreasing)
-};
 
 // x = gelu(x), the tanh approximation.
 kernel void gelu_tanh(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], uint i [[thread_position_in_grid]])
@@ -82,9 +62,6 @@ kernel void silu(device float* x [[buffer(0)]], constant uint& n [[buffer(1)]], 
 
 // Rows [0, rows) of every head between half tiles of different heights: dst[h][r][d] = src[h][r][d].
 // Grid (dim, rows, heads).
-struct HeadRowsArgs {
-    uint dim, src_pad, dst_pad, rows;
-};
 kernel void heads_rows(device const half* src [[buffer(0)]], device half* dst [[buffer(1)]],
                        constant HeadRowsArgs& a [[buffer(2)]], uint3 gid [[thread_position_in_grid]])
 {
@@ -376,10 +353,6 @@ kernel void flash_attn_coop(device const half* q [[buffer(0)]], device const hal
 FLASH_ATTN_COOP(128, 32)
 FLASH_ATTN_COOP(64, 32)
 
-struct HeadsNormArgs {
-    uint ld, col0, dim, n_pad, row0, rope; // as HeadsArgs
-    float eps;
-};
 
 // heads_half with each head's values RMS-normed first (times w[dim]): one threadgroup of dim / 2 threads per
 // (token, head). Grid (rows, heads) threadgroups.
@@ -464,14 +437,6 @@ kernel void rms_norm(device const float* x [[buffer(0)]], device const float* w 
         yr[i] = xr[i] * inv * (a.wn ? w4[i] : float4(1.0f));
 }
 
-struct ScanArgs {
-    uint head_dim;   // 128
-    uint tokens;
-    uint qkv_stride; // q, k, v elements between tokens
-    uint inner;      // g and o elements between tokens
-    uint heads;      // beta elements between tokens
-    uint snap;       // nonzero: also write the state after this many tokens to snap_state (for a rollback)
-};
 
 // One delta-rule step with per-channel decay. M is the state transposed (M[j][i] = S[i][j]):
 //   S[i][:] *= exp(g[i]); delta[j] = (v[j] - sum_i S[i][j] k[i]) * beta
@@ -526,10 +491,6 @@ kernel void kda_scan(device const float* q [[buffer(0)]], device const float* k 
         Mg[lane + n * LANES] = M[n];
 }
 
-struct SwigluArgs {
-    uint n;
-    float limit;   // <= 0: no clamp
-};
 
 // y = silu(min(g, limit)) * clamp(u, -limit, limit); g and u are [rows][n].
 template <typename T>
@@ -591,15 +552,6 @@ kernel void bias_rows(device float* y [[buffer(0)]], device const float* b [[buf
         y[uint64_t(gid.y) * n + gid.x] += b[gid.x];
 }
 
-struct HeadsPartialArgs {
-    uint ld, col0; // x rows ld apart; head h at col0 + h * stride
-    uint stride;
-    uint dim;      // per head (at most 256)
-    uint rot;      // the first rot values rotate, i with i + rot / 2 (0: none)
-    uint n_pad;    // rows of a head in y
-    float eps;     // 0: no norm
-    uint mapped;   // row t of y comes from x row map[t] (and its angles), a zero row where map[t] < 0
-};
 
 // y[h][t][d] = half of head h of row t, RMS-normed (times w) when eps is set, its first rot values rotated by
 // cs[t][i] = (cos, sin). Threadgroups (rows, heads) of dim threads.
@@ -637,11 +589,6 @@ kernel void heads_partial(device const float* x [[buffer(0)]], device const floa
     y[(uint64_t(h) * a.n_pad + tg.x) * a.dim + i] = half(v);
 }
 
-struct LoraArgs {
-    uint k, rows, rank; // the matrix's row length, the rows adapted, the adapter's rank
-    uint b_rot;         // row r of the matrix takes B's row (r + b_rot) % rows
-    float scale;
-};
 
 // W[r][c] += scale * sum_j B[(r + b_rot) % rows][j] * A[j][c] over BF16 (or F16) rows of W (from the adapted ones
 // on), in float, rounded back. Grid (k, rows).
@@ -699,10 +646,6 @@ kernel void lora_merge_i8(device int8_t* w [[buffer(0)]], device const float* a 
         sc[r] = ns;
 }
 
-struct LnAffineArgs {
-    uint n;
-    float eps;
-};
 
 // y = layer_norm(x) * (1 + scale) + shift over each row (no learned weights); one threadgroup per row.
 kernel void ln_affine(device const float* x [[buffer(0)]], device const float* scale [[buffer(1)]],
@@ -727,11 +670,6 @@ kernel void ln_affine(device const float* x [[buffer(0)]], device const float* s
         yr[i] = (xr[i] - mean) * inv * (1.0f + scale[i]) + shift[i];
 }
 
-struct LayerNormArgs {
-    uint n;
-    float eps;
-    uint ystride; // y row stride in elements (0: n)
-};
 
 // y = layer_norm(x) * w + b over each row; one threadgroup per row.
 kernel void layer_norm(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
@@ -775,12 +713,6 @@ static int pad_coord(int i, int n, uint mode)
     return i;
 }
 
-struct Im2colArgs {
-    uint h, w, c;   // input image
-    uint p0, rows;  // output pixels [p0, p0 + rows)
-    uint kpad;      // columns, 9 * c padded to a multiple of 32
-    uint mode;      // the padding's: 0 zeros, 1 reflect
-};
 
 // out[r][ch * 9 + ky * 3 + kx] = x[y + ky - 1][x + kx - 1][ch] for output pixel p0 + r = (y, x), zero outside the
 // image and past 9 * c. Grid (kpad, rows).
@@ -808,9 +740,6 @@ kernel void im2col3x3(device const float* x [[buffer(0)]], device half* out [[bu
 // [0, T) are the zero padding), pixels (stride * y + ky - pad, stride * x + kx - pad) with the spatial padding mode
 // (stride 2: pad above and left `pad`, below and right the mode's); columns (channel, kt, ky * 3 + kx). Grid (kpad,
 // rows).
-struct Im2col3dArgs {
-    int h, w, c, p0, rows, kpad, mode, ow, stride, pad, f0, T;
-};
 kernel void im2col3d(device const float* x [[buffer(0)]], device half* out [[buffer(1)]],
                      constant Im2col3dArgs& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
@@ -829,11 +758,6 @@ kernel void im2col3d(device const float* x [[buffer(0)]], device half* out [[buf
     out[uint64_t(r) * a.kpad + col] = half(v);
 }
 
-struct Im2colS2Args {
-    uint h, w, c, p0, rows, kpad, ow;
-    uint pad;  // above and left of the image: 1, or 0 (then only below and right)
-    uint mode; // the padding's: 0 zeros, 1 reflect
-};
 kernel void im2col3x3_s2(device const float* x [[buffer(0)]], device half* out [[buffer(1)]],
                          constant Im2colS2Args& a [[buffer(2)]], uint2 gid [[thread_position_in_grid]])
 {
@@ -854,11 +778,6 @@ kernel void im2col3x3_s2(device const float* x [[buffer(0)]], device half* out [
 
 // Group norm over channels-last images [rows][c]: per-chunk channel sums, then per-group statistics, then the norm.
 
-struct GnArgs {
-    uint rows, c, groups, chunk; // chunk: rows a threadgroup of gn_partial sums
-    float eps;
-    uint silu;
-};
 
 // part[k][ch] = (sum, sum of squares) of channel ch over rows [k * chunk, (k + 1) * chunk). Grid (c, chunks).
 kernel void gn_partial(device const float* x [[buffer(0)]], device float2* part [[buffer(1)]],
@@ -940,12 +859,6 @@ kernel void gelu_erf(device float* x [[buffer(0)]], constant uint& n [[buffer(1)
 // cubes a coarse pass picks (mean-pooled q and k per cube scored against each other, the top k per head) plus the
 // dense rows (text, conditions, audio) after the cubes; the dense rows' queries attend everything.
 
-struct CubeArgs {
-    uint n_cubes, k_pad, dim; // cubes of 64 rows; rows of a head in the tiles pooled (q's and k's can differ); the width
-    uint topk;                // cube_topk: cubes kept per query cube
-    uint local;               // cube_topk: 1 keeps the query cube itself first, 3 also the cubes `stride` before and after
-    uint stride;              // cubes a frame group apart (the temporal neighbours)
-};
 
 // out[h][c][d] = mean over the cube's valid rows of x[h][c * 64 + r][d] (cnt[c] valid rows). Grid (dim, cubes, heads).
 kernel void cube_pool(device const half* x [[buffer(0)]], device const uint* cnt [[buffer(1)]],
@@ -1050,12 +963,6 @@ kernel void cube_topk(device const float* sc [[buffer(0)]], device ushort* sel [
         nsel[uint64_t(h) * n + qc] = ushort(k);
 }
 
-struct SparseAttnArgs {
-    uint n_q, q_pad, n_k, k_pad, heads, kv_heads, width; // as AttnArgs (rows in the tiles' order)
-    float scale;
-    uint n_cubes, max_sel;  // the first n_cubes query tiles are cubes; sel rows hold max_sel entries
-    uint dense0, dense1;    // the dense rows [dense0, dense1), attended by every cube's queries
-};
 
 // flash_attn_coop over a pass list: query tile qt < n_cubes visits its selected key cubes (two passes each) and the
 // dense rows; a later tile visits every key. Keys with valid[j] == 0 (padding) are masked. The output goes to row
@@ -1211,12 +1118,6 @@ kernel void flash_attn_sparse_128(device const half* q [[buffer(0)]], device con
 // MiniMax-H3's transformer: RMS norms modulated per row of the packed sequence (each row its own (timestep,
 // modality) modulation), gated residuals per row, and a pruned checkpoint's modulation from its curve table.
 
-struct RowModArgs {
-    uint n;         // row width
-    float eps;
-    uint shift_off; // of the shift within a row's modulation, in floats
-    uint scale_off; // of the scale
-};
 
 // y = x / rms(x) * w * (1 + scale) + shift over each row, the row's modulation at mods + off[row] (shift and scale at
 // shift_off and scale_off of it); one threadgroup per row.
@@ -1242,10 +1143,6 @@ kernel void rms_mod_rows(device const float* x [[buffer(0)]], device const float
         yr[i] = xr[i] * inv * w4[i] * (1.0f + sc[i]) + sh[i];
 }
 
-struct GateRowsArgs {
-    uint n;
-    uint gate_off; // of the gate within a row's modulation, in floats
-};
 
 // x[row] += gate[row] * y[row], the row's gate at mods + off[row] + gate_off. Grid (n, rows).
 kernel void gate_add_rows(device float* x [[buffer(0)]], device const float* y [[buffer(1)]],
@@ -1279,3 +1176,90 @@ template [[host_name("curve_mods")]] kernel void curve_mods_t<bfloat>(device con
 template [[host_name("curve_mods_f16")]] kernel void curve_mods_t<half>(device const half*, device const float*,
                                                                         device const float*, device float*,
                                                                         constant uint2&, uint2);
+
+// Qwen3.5's text layers: the gated delta rule's input and output, and the gated attention's heads.
+
+// Causal depthwise convolution over each channel's tokens (zeros before the first), then SiLU: x, y [tokens][channels],
+// w [channels][taps]. One thread per channel.
+kernel void gdn_conv(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
+                     device float* y [[buffer(2)]], constant GdnConvArgs& a [[buffer(3)]],
+                     uint c [[thread_position_in_grid]])
+{
+    if (c >= a.channels)
+        return;
+    device const float* wc = w + uint64_t(c) * a.taps;
+    float hist[8] = {};
+    for (uint t = 0; t < a.tokens; ++t) {
+        const float xc = x[uint64_t(t) * a.channels + c];
+        for (uint j = 0; j + 1 < a.taps; ++j)
+            hist[j] = hist[j + 1];
+        hist[a.taps - 1] = xc;
+        float acc = 0.0f;
+        for (uint j = 0; j < a.taps; ++j)
+            acc += wc[j] * hist[j];
+        y[uint64_t(t) * a.channels + c] = acc / (1.0f + exp(-acc));
+    }
+}
+
+// For each (token, value head) from the convolved q | k | v and the b | a projections: q and k l2-normed and repeated
+// to the value heads, v, the decay g = -exp(A_log) softplus(a + dt_bias) on every channel, beta = sigmoid(b), as the
+// delta-rule scan reads them ([tokens][v_heads * 128]; beta [tokens][v_heads]). Threadgroups (v_heads, tokens) of 128.
+kernel void gdn_prep(device const float* conv [[buffer(0)]], device const float* ba [[buffer(1)]],
+                     device const float* a_log [[buffer(2)]], device const float* dt_bias [[buffer(3)]],
+                     device float* q [[buffer(4)]], device float* k [[buffer(5)]], device float* v [[buffer(6)]],
+                     device float* g [[buffer(7)]], device float* beta [[buffer(8)]],
+                     constant GdnPrepArgs& a [[buffer(9)]], uint2 tg [[threadgroup_position_in_grid]],
+                     uint i [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float part[2][4];
+    const uint h = tg.x, t = tg.y, kh = h / (a.v_heads / a.k_heads), kw = a.k_heads * 128, vw = a.v_heads * 128;
+    device const float* row = conv + uint64_t(t) * a.conv_width;
+    const float qv = row[kh * 128 + i], kv = row[kw + kh * 128 + i];
+    const float sq = simd_sum(qv * qv), sk = simd_sum(kv * kv);
+    if (lane == 0) {
+        part[0][sg] = sq;
+        part[1][sg] = sk;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float nq = part[0][0] + part[0][1] + part[0][2] + part[0][3];
+    const float nk = part[1][0] + part[1][1] + part[1][2] + part[1][3];
+    const uint64_t o = uint64_t(t) * vw + h * 128 + i;
+    q[o] = qv * rsqrt(nq + a.eps);
+    k[o] = kv * rsqrt(nk + a.eps);
+    v[o] = row[2 * kw + h * 128 + i];
+    device const float* bar = ba + uint64_t(t) * 2 * a.v_heads;
+    const float x = bar[a.v_heads + h] + dt_bias[h];
+    const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    g[o] = -exp(a_log[h]) * sp;
+    if (i == 0)
+        beta[uint64_t(t) * a.v_heads + h] = 1.0f / (1.0f + exp(-bar[h]));
+}
+
+// x = rms_norm(x) * w * silu(z) over each 128-wide head of each row. Threadgroups (heads, rows) of 128.
+kernel void gated_rms(device float* x [[buffer(0)]], device const float* z [[buffer(1)]],
+                      device const float* w [[buffer(2)]], constant GatedRmsArgs& a [[buffer(3)]],
+                      uint2 tg [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float part[4];
+    const uint64_t o = uint64_t(tg.y) * a.heads * 128 + tg.x * 128 + i;
+    const float v = x[o], s = simd_sum(v * v);
+    if (lane == 0)
+        part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt((part[0] + part[1] + part[2] + part[3]) / 128.0f + a.eps);
+    const float zz = z[o];
+    x[o] = v * inv * w[i] * (zz / (1.0f + exp(-zz)));
+}
+
+// x[t][h * dim + d] *= sigmoid(src[t][col0 + h * stride + d]). Grid (dim, heads, rows).
+kernel void gate_heads(device float* x [[buffer(0)]], device const float* src [[buffer(1)]],
+                       constant GateHeadsArgs& a [[buffer(2)]], uint3 gid [[thread_position_in_grid]])
+{
+    const uint d = gid.x, h = gid.y, t = gid.z;
+    if (d >= a.dim || h >= a.heads)
+        return;
+    const float gv = src[uint64_t(t) * a.ld + a.col0 + h * a.stride + d];
+    x[(uint64_t(t) * a.heads + h) * a.dim + d] *= 1.0f / (1.0f + exp(-gv));
+}

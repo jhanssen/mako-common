@@ -1,6 +1,7 @@
 #include "models/qwen_text.hpp"
 
 #include "gguf/read_pool.hpp"
+#include "kernels/args.h"
 
 #include <glaze/glaze.hpp>
 
@@ -18,15 +19,11 @@ namespace mako::models {
 
 namespace {
 
-struct HeadsPartialArgs {
-    uint32_t ld, col0, stride, dim, rot, n_pad;
-    float eps;
-};
-struct AttnArgs {
-    uint32_t n_q, q_pad, n_k, k_pad, heads, kv_heads, q_pos0, block, width;
-    float scale;
-    uint32_t limits = 0; // 1: per-query key limits in buffer 5
-};
+using kernels::GateHeadsArgs;
+using kernels::GatedRmsArgs;
+using kernels::GdnConvArgs;
+using kernels::GdnPrepArgs;
+using kernels::ScanArgs;
 
 safetensors::Files open_files(const std::string& path)
 {
@@ -350,18 +347,15 @@ void QwenText::linear_layer(MTL::ComputeCommandEncoder*& enc, const Layer& L, MT
     proj(enc, L.q, xn, 0, m, 0, T);
     proj(enc, L.z, xn, 0, z, 0, T);
     proj(enc, L.ba, xn, 0, ba, 0, T);
-    const uint32_t ca[3] = {width, uint32_t(L.conv.dims[0]), T};
+    const GdnConvArgs ca{width, uint32_t(L.conv.dims[0]), T};
     enc->setComputePipelineState(pso("gdn_conv"));
     enc->setBuffer(m, 0, 0);
     enc->setBuffer(L.conv.buf, L.conv.off, 1);
     enc->setBuffer(mc, 0, 2);
-    enc->setBytes(ca, sizeof(ca), 3);
+    enc->setBytes(&ca, sizeof(ca), 3);
     enc->dispatchThreads(MTL::Size(width, 1, 1), MTL::Size(256, 1, 1));
     after(enc, "gdn_conv");
-    struct {
-        uint32_t k_heads, v_heads, conv_width;
-        float eps;
-    } pa{KH, VH, width, 1e-6f};
+    const GdnPrepArgs pa{KH, VH, width, 1e-6f};
     enc->setComputePipelineState(pso("gdn_prep"));
     enc->setBuffer(mc, 0, 0);
     enc->setBuffer(ba, 0, 1);
@@ -373,18 +367,15 @@ void QwenText::linear_layer(MTL::ComputeCommandEncoder*& enc, const Layer& L, MT
     enc->dispatchThreadgroups(MTL::Size(VH, T, 1), MTL::Size(128, 1, 1));
     after(enc, "gdn_prep");
     // The delta rule with a decay per head: the per-channel scan with each head's decay on all of its channels.
-    const uint32_t sa[6] = {128, T, vw, vw, VH, 0};
+    const ScanArgs sa{128, T, vw, vw, VH, 0};
     enc->setComputePipelineState(pso("kda_scan"));
     for (uint32_t i = 0; i < 7; ++i)
         enc->setBuffer(std::array{q, k, v, g, beta, state, o}[i], 0, i);
-    enc->setBytes(sa, sizeof(sa), 7);
+    enc->setBytes(&sa, sizeof(sa), 7);
     enc->setBuffer(state, 0, 8);
     enc->dispatchThreadgroups(MTL::Size(VH, 4, 1), MTL::Size(128, 1, 1));
     after(enc, "kda_scan");
-    const struct {
-        uint32_t heads;
-        float eps;
-    } ga{VH, eps_};
+    const GatedRmsArgs ga{VH, eps_};
     enc->setComputePipelineState(pso("gated_rms"));
     enc->setBuffer(o, 0, 0);
     enc->setBuffer(z, 0, 1);
@@ -417,8 +408,8 @@ void QwenText::gated_attention(MTL::ComputeCommandEncoder*& enc, const Layer& L,
     heads_partial(enc, k, kw, 0, D, D, rot_, KV, T, k_pad, cs, &L.k_norm, eps_, kh);
     heads_partial(enc, v, kw, 0, D, D, 0, KV, T, k_pad, cs, nullptr, 0.0f, vh);
     attention(enc, qh, kh, vh, att, T, q_pad, T, k_pad, H, KV, 0, UINT32_MAX, D);
-    const uint32_t ga[5] = {H, D, qw, D, 2 * D};
-    dispatch(enc, "gate_heads", {att, q}, ga, sizeof(ga), MTL::Size(D, H, T), MTL::Size(64, 1, 1));
+    const GateHeadsArgs ga{H, D, qw, D, 2 * D};
+    dispatch(enc, "gate_heads", {att, q}, &ga, sizeof(ga), MTL::Size(D, H, T), MTL::Size(64, 1, 1));
     proj(enc, L.o, att, 0, y, 0, T);
 }
 

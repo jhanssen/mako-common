@@ -1,6 +1,7 @@
 #include "models/qwen_vision.hpp"
 
 #include "log/log.hpp"
+#include "kernels/args.h"
 
 #include <algorithm>
 #include <cmath>
@@ -27,11 +28,7 @@ uint16_t to_bf16(float f)
     return uint16_t((u + 0x7fff + ((u >> 16) & 1)) >> 16);
 }
 
-struct LayerNormArgs {
-    uint32_t n;
-    float eps;
-    uint32_t ystride = 0;
-};
+using kernels::LayerNormArgs;
 
 } // namespace
 
