@@ -117,13 +117,13 @@ template [[host_name("mako_mul_mv_q6_K_t4")]] kernel void mako_mul_mv_q6_K_token
 // The library's Q8_0 row loop (kernel_mul_mv_q8_0_f32_impl) over TOK tokens a threadgroup: each block's quants and
 // scale read once for all of them, each token's sums formed as that loop forms them, so every token's result is the
 // one-token kernel's bit for bit. x_tok / y_tok: bytes between tokens' x and y rows.
-template <short TOK, typename args_t>
+template <short TOK, typename args_t, short NR0 = N_R0_Q8_0>
 void mako_q8_0_tokens_impl(args_t args, device const char* src0, device const char* src1, device char* dst,
                            uint64_t x_tok, uint64_t y_tok, threadgroup char* shmem, uint3 tgpig, ushort tiisg,
                            ushort sgitg)
 {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NR0 = N_R0_Q8_0, NW = N_SIMDWIDTH, NQ = 8;
+    constexpr short NW = N_SIMDWIDTH, NQ = 8;
     const int nb = args.ne00 / QK8_0;
     const int r0 = tgpig.x * NR0;
     const int im = tgpig.z;
@@ -132,7 +132,9 @@ void mako_q8_0_tokens_impl(args_t args, device const char* src0, device const ch
     const uint64_t offset1 = i12 * args.nb12 + i13 * args.nb13;
     device const block_q8_0* ax[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row) * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 + (i13 / FC_mul_mv_r3) * args.nb03;
+        // Rows past the matrix read its last one (their sums are not written).
+        const uint64_t offset0 = min(r0 + row, args.ne01 - 1) * args.nb01 + (i12 / FC_mul_mv_r2) * args.nb02 +
+                                 (i13 / FC_mul_mv_r3) * args.nb03;
         ax[row] = (device const block_q8_0*)((device char*)src0 + offset0);
     }
     float sumf[TOK][NR0];
@@ -146,47 +148,70 @@ void mako_q8_0_tokens_impl(args_t args, device const char* src0, device const ch
     FOR_UNROLL (short t = 0; t < TOK; ++t)
         yb[t] = (device const float*)(src1 + offset1 + t * x_tok) + ib0 * QK8_0 + il * NQ;
     for (int ib = ib0; ib < nb; ib += NSG * NQ) {
-        float yl[TOK][NQ];
-        FOR_UNROLL (short t = 0; t < TOK; ++t)
-            for (short i = 0; i < NQ; ++i)
-                yl[t][i] = yb[t][i];
-        for (short row = 0; row < NR0; row++) {
+        // Each row's quants and scale once, then one token's x at a time (all tokens' at once spill).
+        float q[NR0][NQ], d[NR0];
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const int8_t* qs = ax[row][ib].qs + il * NQ;
-            int8_t q[NQ];
             FOR_UNROLL (short i = 0; i < NQ; ++i)
-                q[i] = qs[i];
-            FOR_UNROLL (short t = 0; t < TOK; ++t) {
+                q[row][i] = qs[i];
+            d[row] = ax[row][ib].d;
+        }
+        FOR_UNROLL (short t = 0; t < TOK; ++t) {
+            float yl[NQ];
+            FOR_UNROLL (short i = 0; i < NQ; ++i)
+                yl[i] = yb[t][i];
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
                 float sumq = 0.f;
                 FOR_UNROLL (short i = 0; i < NQ; ++i)
-                    sumq += q[i] * yl[t][i];
-                sumf[t][row] += sumq * ax[row][ib].d;
+                    sumq += q[row][i] * yl[i];
+                sumf[t][row] += sumq * d[row];
             }
         }
         FOR_UNROLL (short t = 0; t < TOK; ++t)
             yb[t] += NSG * NQ * QK8_0;
     }
-    for (short t = 0; t < TOK; ++t) {
-        device float* dst_f32 = (device float*)(dst + t * y_tok) + (uint64_t)im * args.ne0 * args.ne1;
-        helper_mv_reduce_and_write<NR0>(dst_f32, sumf[t], r0, args.ne01, tiisg, sgitg, shmem);
-        threadgroup_barrier(mem_flags::mem_threadgroup); // the reduction's rows are written again for the next token
+    // helper_mv_reduce_and_write's sums for every token at once (two barriers, not two a token): each simdgroup's
+    // sum in lane sgitg of a zeroed row of 32, then a simdgroup's simd_sum of that row.
+    threadgroup float* part = (threadgroup float*)shmem;
+    for (short i = sgitg; i < TOK * NR0; i += NSG)
+        part[i * NW + tiisg] = 0.0f;
+    float tot[TOK][NR0];
+    FOR_UNROLL (short t = 0; t < TOK; ++t)
+        FOR_UNROLL (short row = 0; row < NR0; ++row)
+            tot[t][row] = simd_sum(sumf[t][row]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0)
+        FOR_UNROLL (short t = 0; t < TOK; ++t)
+            FOR_UNROLL (short row = 0; row < NR0; ++row)
+                part[(t * NR0 + row) * NW + sgitg] = tot[t][row];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short i = sgitg; i < TOK * NR0; i += NSG) {
+        const short t = i / NR0, row = i % NR0;
+        const float v = simd_sum(part[i * NW + tiisg]);
+        if (tiisg == 0 && r0 + row < args.ne01)
+            ((device float*)(dst + t * y_tok) + (uint64_t)im * args.ne0 * args.ne1)[r0 + row] = v;
     }
 }
 
-template <short TOK>
+// NR0 rows a threadgroup: x, which every threadgroup reads whole for all TOK tokens, read once for that many rows.
+template <short TOK, short NR0>
 kernel void mako_mul_mv_q8_0_tokens(constant ggml_metal_kargs_mul_mv& args, device const char* src0,
                                     device const char* src1, device char* dst, threadgroup char* shmem [[threadgroup(0)]],
                                     uint3 tgpig [[threadgroup_position_in_grid]],
                                     ushort tiisg [[thread_index_in_simdgroup]],
                                     ushort sgitg [[simdgroup_index_in_threadgroup]])
 {
-    mako_q8_0_tokens_impl<TOK, constant ggml_metal_kargs_mul_mv&>(args, src0, src1, dst, args.nb11,
-                                                                   uint64_t(args.ne0) * 4, shmem, tgpig, tiisg, sgitg);
+    mako_q8_0_tokens_impl<TOK, constant ggml_metal_kargs_mul_mv&, NR0>(args, src0, src1, dst, args.nb11,
+                                                                        uint64_t(args.ne0) * 4, shmem, tgpig, tiisg,
+                                                                        sgitg);
 }
 
-#define Q8_TOKENS(n) template [[host_name("mako_mul_mv_q8_0_f32_t" #n)]] kernel void mako_mul_mv_q8_0_tokens<n>( \
-    constant ggml_metal_kargs_mul_mv&, device const char*, device const char*, device char*, threadgroup char*, uint3, \
-    ushort, ushort);
-Q8_TOKENS(2) Q8_TOKENS(3) Q8_TOKENS(4) Q8_TOKENS(5) Q8_TOKENS(6) Q8_TOKENS(7) Q8_TOKENS(8)
+#define Q8_TOKENS(n, r) template [[host_name("mako_mul_mv_q8_0_f32_t" #n "_r" #r)]] kernel void \
+    mako_mul_mv_q8_0_tokens<n, r>(constant ggml_metal_kargs_mul_mv&, device const char*, device const char*, \
+                                  device char*, threadgroup char*, uint3, ushort, ushort);
+#define Q8_TOKENS_R(r) Q8_TOKENS(2, r) Q8_TOKENS(3, r) Q8_TOKENS(4, r) Q8_TOKENS(5, r) Q8_TOKENS(6, r) \
+    Q8_TOKENS(7, r) Q8_TOKENS(8, r)
+Q8_TOKENS_R(2) Q8_TOKENS_R(4) Q8_TOKENS_R(8)
 
 typedef decltype(mako_mul_mv_slots<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) mako_mul_mv_slots_t;
 typedef decltype(mako_mul_mv_slots<mmv_fn<kernel_mul_mv_t_t_4_disp<float, float4, float, float4>>>) mako_mul_mv_slots_4_t;

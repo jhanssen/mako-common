@@ -4,6 +4,7 @@
 #include "kernels/args.h"
 
 #include <format>
+#include <vector>
 #include <string_view>
 #include <stdexcept>
 
@@ -176,7 +177,9 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
     const bool vec4 = type == gguf::Type::F32 && k % 4 == 0;
     if (indexed)
         batch = 1;
-    auto key = std::make_tuple(type, vec4, batch, indexed, tokens);
+    // Q8_0 over several tokens: rows a threadgroup by k (below).
+    const uint32_t q8_rows = tokens > 0 && type == gguf::Type::Q8_0 ? (k >= 12288 ? 4 : 2) : 0;
+    auto key = std::make_tuple(type, vec4, batch, indexed, tokens, q8_rows);
     if (auto it = kernels_.find(key); it != kernels_.end())
         return it->second;
 
@@ -219,8 +222,13 @@ Gemv::Kernel& Gemv::kernel(gguf::Type type, uint32_t k, uint32_t batch, bool ind
         name.replace(0, std::string_view("mako_mul_mv_").size(), "mako_mul_mv_slots_mako_");
     else if (indexed)
         name.replace(0, std::string_view("kernel_mul_mv_").size(), "mako_mul_mv_slots_");
-    else if (tokens > 0 && type == gguf::Type::Q8_0)
-        name = std::format("mako_mul_mv_q8_0_f32_t{}", tokens);
+    else if (tokens > 0 && type == gguf::Type::Q8_0) {
+        // Long rows: 4 rows a threadgroup, so the tokens' x (all of it each threadgroup's) is read half as often.
+        const int r = int(q8_rows);
+        kern.nr0 = r;
+        kern.smem = 32 * 4 * r * int(tokens);
+        name = std::format("mako_mul_mv_q8_0_f32_t{}_r{}", tokens, r);
+    }
     else if (tokens > 0)
         name = std::format("mako_mul_mv_q6_K_t{}", tokens);
 
@@ -372,8 +380,25 @@ void Gemv::encode_jobs(MTL::ComputeCommandEncoder* enc, std::span<const Job> job
         fc->setConstantValue(&split, MTL::DataTypeBool, 605);
         jobs_pso_ = ctx_.pipeline(lib_.get(), "mako_mul_mv_jobs", fc.get());
     }
-    auto* rows = reinterpret_cast<GemvJob*>(static_cast<char*>(table->contents()) + table_off);
     const uint32_t T = jobs[0].a.t;
+    // Plain Q8_0 jobs over several tokens: their own dispatches of the token kernel (each weight block read once for
+    // all of them; within the job kernel it runs slower).
+    if (T > 1 && own_kernels_) {
+        std::vector<Job> rest;
+        for (const Job& j : jobs) {
+            // (Rows of 512 or fewer: encode() takes the short-row kernel, which sums otherwise than the job's.)
+            if (j.a.type == gguf::Type::Q8_0 && !j.ids && j.a.t == T && j.a.batch == 1 && j.a.k > 512 &&
+                (!j.ldy || j.ldy == j.a.n))
+                encode(enc, j.a, j.w, j.w_off, j.x, j.x_off, j.y, j.y_off);
+            else
+                rest.push_back(j);
+        }
+        if (rest.size() < jobs.size()) {
+            encode_jobs(enc, rest, table, table_off);
+            return;
+        }
+    }
+    auto* rows = reinterpret_cast<GemvJob*>(static_cast<char*>(table->contents()) + table_off);
     uint32_t tg = 0;
     for (size_t i = 0; i < jobs.size(); ++i) {
         const Job& j = jobs[i];

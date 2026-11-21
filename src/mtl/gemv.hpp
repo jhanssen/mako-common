@@ -115,7 +115,7 @@ private:
     Ref<MTL::ComputePipelineState> router_pso_; // encode_router: built for the first k seen
     int router_nsg_ = 0;
     Ref<MTL::ComputePipelineState> jobs_pso_;
-    std::map<std::tuple<gguf::Type, bool, uint32_t, bool, uint32_t>, Kernel> kernels_;
+    std::map<std::tuple<gguf::Type, bool, uint32_t, bool, uint32_t, uint32_t>, Kernel> kernels_;
 };
 
 } // namespace mako::mtl
